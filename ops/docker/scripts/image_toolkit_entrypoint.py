@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import json
-import os
 import re
 import shutil
 import signal
@@ -36,6 +35,19 @@ KREA2_TEXT_ENCODER_CACHE = CACHE_ROOT / "hf_cache" / "Qwen--Qwen3-VL-4B-Instruct
 # needs room for the post-train calibration, every other type just needs enough
 # for the SIGTERM -> checkpoint-promote path below.
 CALIBRATION_RESERVE_S = 420
+
+# WHICH post-training pass krea2 gets. "calibrate" is what is measured today
+# (dropping the text-fusion group won all six paired comparisons, 1.0-4.0%).
+# "select" is the newer pass: score the checkpoint grid on the eval's own
+# objective and ship the minimum instead of whatever the wall happened to land
+# on. Both share one model load, and selection runs first because a strength
+# measured on one checkpoint says nothing about another.
+#
+# It ships as "calibrate" until the harness run has priced the two against each
+# other inside this reserve -- selection eats the budget calibration needs, and
+# trading a measured 1-4% for an unmeasured pass is the trade this workspace
+# keeps writing down as a mistake. Flip the constant, do not add a fallback.
+POST_TRAIN_MODE = "calibrate"
 PROMOTE_RESERVE_S = 120
 TERM_GRACE_S = 30
 
@@ -114,14 +126,14 @@ def prepare_config(args: argparse.Namespace, dataset_path: Path) -> Path:
         config = yaml.safe_load(file)
 
     config_body = config.setdefault("config", {})
-    # "last", NOT expected_repo_name. ai-toolkit names the final checkpoint
-    # "<config.name>.safetensors", and the evaluator picks the submission by
-    # looking for a file named exactly "last.safetensors" -- its fallback is a
-    # numbered-checkpoint regex the unnumbered final file does not match, so a
-    # repo-named config silently submits the SECOND-to-last checkpoint and the
-    # final save never leaves the container. (The HF repo name comes from the
-    # uploader's EXPECTED_REPO_NAME env, not from this field.)
-    config_body["name"] = "last"
+    # expected_repo_name, and it is NOT cosmetic: ai-toolkit writes to
+    # <training_folder>/<config.name>, and the uploader reads exactly
+    # /app/checkpoints/<task_id>/<expected_repo_name>. Renaming this to "last" (to make the
+    # evaluator's picker find the final save) cost us all three tasks of the 2026-08-17 image
+    # round -- trained weights on disk, uploader looking at a path that did not exist,
+    # submission_id None. The evaluator's need is met in promote_latest_checkpoint instead,
+    # by putting a `last.safetensors` COPY inside this same folder.
+    config_body["name"] = args.expected_repo_name
 
     process = config_body.setdefault("process", [{}])[0]
     process["training_folder"] = str(CHECKPOINTS_ROOT / args.task_id)
@@ -180,21 +192,43 @@ def _calibration_model_kwargs(args: argparse.Namespace) -> dict:
     }
 
 
-def promote_latest_checkpoint(training_folder: Path) -> None:
-    """Copy the highest-step numbered checkpoint to last.safetensors.
+def promote_latest_checkpoint(output_folder: Path, config_name: str) -> None:
+    """Guarantee a file named exactly last.safetensors INSIDE the folder the uploader reads.
 
-    ai-toolkit only writes the unnumbered final file when the run COMPLETES, and
-    the evaluator's picker wants a file named exactly last.safetensors. A run
-    stopped at the wall would otherwise ship nothing usable even with 90% of the
-    training done. Skips files modified in the last 30s -- the trainer may have
-    been mid-save when it was stopped, and a truncated safetensors scores zero.
+    Two contracts have to hold at once, and 2026-08-17 was the week we honoured one by
+    breaking the other -- three tasks trained fine and shipped nothing:
+
+      * the UPLOADER reads `/app/checkpoints/<task_id>/<expected_repo_name>` verbatim
+        (`trainer/training_paths.get_checkpoints_output_path`). ai-toolkit writes to
+        `<training_folder>/<config.name>`, so config.name IS that contract -- rename it and
+        the uploader's folder does not exist, the container dies on FileNotFoundError, and
+        the task is recorded with no submission at all, whatever sits on disk.
+      * the EVALUATOR picks a submission by scanning for a file ending in `last.safetensors`
+        (`validator/evaluation/constants.py`), falling back to a numbered-checkpoint regex
+        that the unnumbered final save does NOT match -- so without this copy the run ships
+        its second-to-last checkpoint.
+
+    COPY, never rename: the numbered series has to stay intact for the fallback picker, and
+    the unnumbered final save is what ai-toolkit itself considers complete. Files touched in
+    the last 30s are skipped -- the trainer may have been mid-save when the wall stopped it,
+    and a truncated safetensors scores zero rather than slightly worse.
     """
+    target = output_folder / "last.safetensors"
+    if target.exists():
+        print(f"[wall] last.safetensors already in place ({target})", flush=True)
+        return
+
+    # A completed run writes `<config.name>.safetensors`; that is the real final weight.
+    final = output_folder / f"{config_name}.safetensors"
+    if final.exists():
+        shutil.copy2(final, target)
+        print(f"[wall] promoted completed run's final save to {target}", flush=True)
+        return
+
     settled: list[tuple[int, Path]] = []
     fresh: list[tuple[int, Path]] = []
     newest_ok = time.time() - 30
-    for path in training_folder.rglob("*.safetensors"):
-        if path.name == "last.safetensors":
-            return  # completed naturally; the real final file wins
+    for path in output_folder.rglob("*.safetensors"):
         match = NUMBERED_CKPT_RE.search(path.name)
         if match:
             bucket = settled if path.stat().st_mtime < newest_ok else fresh
@@ -202,10 +236,10 @@ def promote_latest_checkpoint(training_folder: Path) -> None:
     # A fresh file is only worth the truncation risk when it is all there is.
     candidates = settled or fresh
     if not candidates:
-        print("[wall] no promotable checkpoint found", flush=True)
+        print(f"[wall] NO PROMOTABLE CHECKPOINT in {output_folder} -- this run ships nothing",
+              flush=True)
         return
     step, source = max(candidates)
-    target = source.parent / "last.safetensors"
     shutil.copy2(source, target)
     print(f"[wall] promoted step-{step} checkpoint to {target}", flush=True)
 
@@ -236,6 +270,28 @@ def run_training(config_path: Path, train_deadline: float) -> None:
             return
 
 
+def _report_submission(output_folder: Path) -> None:
+    """State, in the container log, exactly what this run is handing to the uploader.
+
+    The uploader refuses an absent or metadata-only folder, and that refusal is the whole
+    difference between a scored submission and a silent zero. When it happens the only trace
+    left anywhere is a `submission_id: None` row in the public audit days later, so the fact
+    is printed here while the container is still alive to be read.
+    """
+    if not output_folder.is_dir():
+        print(f"[submit] FOLDER MISSING: {output_folder} -- uploader will find nothing",
+              flush=True)
+        return
+    weights = sorted(output_folder.glob("*.safetensors"))
+    total = sum(p.stat().st_size for p in weights)
+    names = ", ".join(p.name for p in weights) or "(yok)"
+    print(f"[submit] {output_folder}: {len(weights)} safetensors, {total / 1e6:.0f} MB -> {names}",
+          flush=True)
+    if not (output_folder / "last.safetensors").exists():
+        print("[submit] WARNING: last.safetensors yok — evaluator numaralı checkpoint'e düşecek",
+              flush=True)
+
+
 def main() -> None:
     started = time.time()
     args = parse_args()
@@ -248,12 +304,21 @@ def main() -> None:
     # an unguarded run regularly dies mid-save with nothing named for the
     # evaluator to pick up.
     training_folder = CHECKPOINTS_ROOT / args.task_id
+    output_folder = training_folder / args.expected_repo_name
     reserve = CALIBRATION_RESERVE_S if args.model_type == "krea2" else PROMOTE_RESERVE_S
     run_training(config_path, deadline - reserve)
-    promote_latest_checkpoint(training_folder)
+    # Post-training steps must never be the reason a trained artefact fails to ship. The
+    # harness marks a task FAILED and uploads NOTHING when this container exits non-zero,
+    # while a container killed at the wall is treated as success and whatever is on disk goes
+    # up (trainer/runtime.py). An exception here would therefore throw away a finished run.
+    try:
+        promote_latest_checkpoint(output_folder, args.expected_repo_name)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[wall] promote failed ({type(exc).__name__}: {exc})", flush=True)
+    _report_submission(output_folder)
 
     if args.model_type == "krea2":
-        # Post-training strength calibration (see lora_calibration.py). check=False
+        # Post-training pass (see lora_calibration.py, POST_TRAIN_MODE). check=False
         # and a hard deadline inside: whatever calibration does or fails to do, the
         # artefact ai-toolkit saved is already on disk and stays the submission
         # unless calibration finds a measured improvement to fold in.
@@ -261,6 +326,7 @@ def main() -> None:
             [
                 "python3",
                 "/usr/local/bin/lora_calibration.py",
+                "--mode", POST_TRAIN_MODE,
                 "--training-folder", str(CHECKPOINTS_ROOT / args.task_id),
                 "--dataset-dir", str(dataset_path),
                 "--base-model", str(cached_model_path(args.model)),

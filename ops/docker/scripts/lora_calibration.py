@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Post-training LoRA strength calibration for krea2 submissions.
+"""Post-training checkpoint selection and LoRA strength calibration for krea2.
 
 The submitted artefact is the LoRA weight file itself. ComfyUI loads it with
 strength_model fixed at 1 and the file carries no alpha keys, so the *effective*
@@ -235,108 +235,142 @@ def denoise_schedule(build, steps: int, denoise: float):
     return build(int(steps / denoise))[-(steps + 1):]
 
 
-def score_candidates(lora_path: str, dataset_dir: str, base_model_path: str,
-                     model_kwargs: dict, deadline: float,
-                     images: int = 4, seeds_n: int = 2) -> dict:
-    import numpy as np
-    import torch
-    from PIL import Image
+class _Scorer:
+    """The krea2 model, loaded once, scoring whatever adapter is applied to it
+    under the eval's exact conditions.
 
-    sys.path.insert(0, str(AI_TOOLKIT_ROOT))
-    from toolkit.config_modules import ModelConfig
-    from extensions_built_in.diffusion_models.krea2.krea2 import Krea2Model
-    from extensions_built_in.diffusion_models.krea2.src.pipeline import timesteps
+    Both callers need the same number: calibration asks it of one artefact at
+    several strengths, selection asks it of several checkpoints at strength 1.
+    They share this class rather than a copied loop because a scorer that drifts
+    from the eval answers a different question -- and the two call sites drifting
+    from EACH OTHER would be worse still: we would be choosing a checkpoint under
+    one objective and then tuning it under another.
+    """
 
-    device = torch.device("cuda")
-    model_config = ModelConfig(name_or_path=base_model_path, arch="krea2",
-                               dtype="bf16", model_kwargs=dict(model_kwargs or {}))
-    model = Krea2Model(device=device, model_config=model_config, dtype="bf16")
-    model.load_model()
+    def __init__(self, dataset_dir: str, base_model_path: str, model_kwargs: dict,
+                 images: int = 4, seeds_n: int = 2):
+        import numpy as np
+        import torch
+        from PIL import Image
 
-    empty_embeds = model.get_prompt_embeds("")
-    pairs = collect_pairs(dataset_dir, images)
-    seeds = eval_seeds(seeds_n)
-    deltas = load_lora(lora_path, device, torch.float32)
+        sys.path.insert(0, str(AI_TOOLKIT_ROOT))
+        from toolkit.config_modules import ModelConfig
+        from extensions_built_in.diffusion_models.krea2.krea2 import Krea2Model
+        from extensions_built_in.diffusion_models.krea2.src.pipeline import timesteps
 
-    def to_tensor(image):
-        array = np.asarray(image.convert("RGB"), np.float32) / 127.5 - 1.0
-        return torch.from_numpy(array).permute(2, 0, 1).to(device)
+        self.np, self.torch, self.Image, self.timesteps = np, torch, Image, timesteps
+        self.device = torch.device("cuda")
+        model_config = ModelConfig(name_or_path=base_model_path, arch="krea2",
+                                   dtype="bf16", model_kwargs=dict(model_kwargs or {}))
+        self.model = Krea2Model(device=self.device, model_config=model_config, dtype="bf16")
+        self.model.load_model()
 
-    def to_image(tensor):
+        self.empty_embeds = self.model.get_prompt_embeds("")
+        self.pairs = collect_pairs(dataset_dir, images)
+        self.seeds = eval_seeds(seeds_n)
+        self.per_candidate: float | None = None
+
+    def _to_tensor(self, image):
+        array = self.np.asarray(image.convert("RGB"), self.np.float32) / 127.5 - 1.0
+        return self.torch.from_numpy(array).permute(2, 0, 1).to(self.device)
+
+    def _to_image(self, tensor):
         array = tensor.detach().float().clamp(-1, 1).add(1).mul(127.5)
-        array = array.round().clamp(0, 255).to("cpu").numpy().astype(np.uint8)
-        return Image.fromarray(array.transpose(1, 2, 0))
+        array = array.round().clamp(0, 255).to("cpu").numpy().astype(self.np.uint8)
+        return self.Image.fromarray(array.transpose(1, 2, 0))
 
-    def l2(reference, produced):
-        a = np.asarray(reference.convert("RGB"), np.float32) / 255.0
-        b = np.asarray(produced.convert("RGB"), np.float32) / 255.0
-        return float(np.mean((a - b) ** 2))
+    def _l2(self, reference, produced):
+        a = self.np.asarray(reference.convert("RGB"), self.np.float32) / 255.0
+        b = self.np.asarray(produced.convert("RGB"), self.np.float32) / 255.0
+        return float(self.np.mean((a - b) ** 2))
 
-    @torch.no_grad()
-    def sample(latents, schedule, cond, uncond, guidance):
-        latents = latents.clone()
-        for current, following in zip(schedule[:-1], schedule[1:]):
-            t = torch.full((latents.shape[0],), current * 1000.0, device=device)
-            velocity = model.get_noise_prediction(latents.to(model.torch_dtype), t, cond)
-            if uncond is not None and guidance > 0:
-                velocity_uncond = model.get_noise_prediction(
-                    latents.to(model.torch_dtype), t, uncond)
-                velocity = velocity + guidance * (velocity - velocity_uncond)
-            latents = latents + (following - current) * velocity.float()
-        return to_image(model.decode_latents(latents)[0])
+    def _sample(self, latents, schedule, cond, uncond, guidance):
+        torch = self.torch
+        with torch.no_grad():
+            latents = latents.clone()
+            for current, following in zip(schedule[:-1], schedule[1:]):
+                t = torch.full((latents.shape[0],), current * 1000.0, device=self.device)
+                velocity = self.model.get_noise_prediction(
+                    latents.to(self.model.torch_dtype), t, cond)
+                if uncond is not None and guidance > 0:
+                    velocity_uncond = self.model.get_noise_prediction(
+                        latents.to(self.model.torch_dtype), t, uncond)
+                    velocity = velocity + guidance * (velocity - velocity_uncond)
+                latents = latents + (following - current) * velocity.float()
+            return self._to_image(self.model.decode_latents(latents)[0])
 
-    results = {}
-    rejected = {}
-    started = time.time()
-    per_candidate = None
-    control_structure = None
+    def fits(self, deadline: float) -> bool:
+        """False once the NEXT candidate is projected to cross the deadline."""
+        return self.per_candidate is None or time.time() + self.per_candidate <= deadline
 
-    def measure(blocks: float, txtfusion: float) -> float | None:
-        nonlocal per_candidate, control_structure
-        if per_candidate is not None and time.time() + per_candidate > deadline:
-            log(f"deadline: stopping before ({blocks}, {txtfusion})")
-            return None
-        candidate_started = time.time()
-        apply_lora(model, deltas, blocks, txtfusion, sign=1.0)
+    def score(self, apply_cb, unapply_cb) -> tuple[float, float]:
+        """(weighted loss, structure ratio) for the adapter apply_cb installs."""
+        np, torch = self.np, self.torch
+        started = time.time()
+        apply_cb()
         text_losses, no_text_losses, structure = [], [], []
-        for image_path, caption in pairs:
-            reference = Image.open(image_path)
+        for image_path, caption in self.pairs:
+            reference = self.Image.open(image_path)
             width, height = adjust_size(*reference.size)
-            reference = reference.resize((width, height), Image.Resampling.LANCZOS)
-            latent = model.encode_images([to_tensor(reference)])
-            align = model.vae_scale_factor * model.patch_size
+            reference = reference.resize((width, height), self.Image.Resampling.LANCZOS)
+            latent = self.model.encode_images([self._to_tensor(reference)])
+            align = self.model.vae_scale_factor * self.model.patch_size
             gh, gw = height // align, width // align
             schedule = denoise_schedule(
-                lambda n: timesteps(gh * gw, n, x1=(256 // align) ** 2,
-                                    x2=(1280 // align) ** 2, y1=0.5, y2=1.15),
+                lambda n: self.timesteps(gh * gw, n, x1=(256 // align) ** 2,
+                                         x2=(1280 // align) ** 2, y1=0.5, y2=1.15),
                 EVAL_STEPS, EVAL_DENOISE)
-            caption_embeds = model.get_prompt_embeds(caption)
-            for seed in seeds:
-                generator = torch.Generator(device=device).manual_seed(seed)
+            caption_embeds = self.model.get_prompt_embeds(caption)
+            for seed in self.seeds:
+                generator = torch.Generator(device=self.device).manual_seed(seed)
                 noise = torch.randn(latent.shape, generator=generator,
-                                    device=device, dtype=torch.float32)
+                                    device=self.device, dtype=torch.float32)
                 start = schedule[0]
                 noised = latent.float() * (1.0 - start) + noise * start
-                produced_no_text = sample(noised, schedule, empty_embeds, None, 0.0)
-                produced_text = sample(noised, schedule, caption_embeds,
-                                       empty_embeds, EVAL_CFG)
-                no_text_losses.append(l2(reference, produced_no_text))
-                text_losses.append(l2(reference, produced_text))
-                # Does it still have the reference's structure, or has it gone flat?
-                reference_std = float(np.asarray(reference.convert("RGB"),
-                                                 np.float32).std())
+                produced_no_text = self._sample(noised, schedule, self.empty_embeds, None, 0.0)
+                produced_text = self._sample(noised, schedule, caption_embeds,
+                                             self.empty_embeds, EVAL_CFG)
+                no_text_losses.append(self._l2(reference, produced_no_text))
+                text_losses.append(self._l2(reference, produced_text))
+                reference_std = float(np.asarray(reference.convert("RGB"), np.float32).std())
                 if reference_std > 1e-6:
                     for produced in (produced_no_text, produced_text):
                         structure.append(
-                            float(np.asarray(produced.convert("RGB"),
-                                             np.float32).std()) / reference_std)
-        apply_lora(model, deltas, blocks, txtfusion, sign=-1.0)
+                            float(np.asarray(produced.convert("RGB"), np.float32).std())
+                            / reference_std)
+        unapply_cb()
         weighted = (TEXT_GUIDED_WEIGHT * float(np.mean(text_losses))
                     + (1 - TEXT_GUIDED_WEIGHT) * float(np.mean(no_text_losses)))
         ratio = float(np.mean(structure)) if structure else 1.0
-        per_candidate = time.time() - candidate_started
+        self.per_candidate = time.time() - started
+        return weighted, ratio
+
+
+def score_candidates(lora_path: str, dataset_dir: str, base_model_path: str,
+                     model_kwargs: dict, deadline: float,
+                     images: int = 4, seeds_n: int = 2, scorer: "_Scorer | None" = None) -> dict:
+    import torch
+
+    # Loading krea2 costs minutes. When selection ran first it already paid that,
+    # and handing its scorer over here is the difference between one model load
+    # per job and two -- out of a reserve measured in minutes.
+    scorer = scorer or _Scorer(dataset_dir, base_model_path, model_kwargs, images, seeds_n)
+    deltas = load_lora(lora_path, scorer.device, torch.float32)
+    results: dict = {}
+    rejected: dict = {}
+    control_structure = None
+    started = time.time()
+
+    for blocks, txtfusion in OPENERS:
+        if not scorer.fits(deadline):
+            log(f"deadline: stopping before ({blocks}, {txtfusion})")
+            break
+        weighted, ratio = scorer.score(
+            lambda b=blocks, t=txtfusion: apply_lora(scorer.model, deltas, b, t, sign=1.0),
+            lambda b=blocks, t=txtfusion: apply_lora(scorer.model, deltas, b, t, sign=-1.0),
+        )
         log(f"blocks={blocks} txtfusion={txtfusion} weighted={weighted:.6f} "
-            f"structure={ratio:.2f} ({per_candidate:.0f}s)")
+            f"structure={ratio:.2f} ({scorer.per_candidate:.0f}s)")
         if (blocks, txtfusion) == (1.0, 1.0):
             control_structure = ratio      # the bar every other candidate is held to
         elif control_structure and ratio < STRUCTURE_FLOOR * control_structure:
@@ -345,23 +379,17 @@ def score_candidates(lora_path: str, dataset_dir: str, base_model_path: str,
             log(f"  rejected: structure {ratio:.2f} < "
                 f"{STRUCTURE_FLOOR:.2f} x {control_structure:.2f} (as-trained)")
             rejected[(blocks, txtfusion)] = weighted
-            return None
+            continue
         results[(blocks, txtfusion)] = weighted
-        return weighted
 
-    # Openers: is the text-fusion group worth carrying at all?
-    for blocks, txtfusion in OPENERS:
-        measure(blocks, txtfusion)
     if len(results) < len(OPENERS):
         log("no budget past the openers")
         return results
     log(f"txtfusion group -> "
         f"{0.0 if results[(1.0, 0.0)] <= results[(1.0, 1.0)] else 1.0}")
-
     log(f"scored {len(results)} candidates ({len(rejected)} rejected) "
         f"in {time.time() - started:.0f}s")
     return results
-
 
 # ------------------------------------------------------------------------ main
 def find_submission(training_folder: str) -> str | None:
@@ -381,8 +409,146 @@ def find_submission(training_folder: str) -> str | None:
     return None
 
 
+# ------------------------------------------------------------------- select
+# What the validator ships is ONE file: `last.safetensors` if the uploaded folder
+# has one, otherwise the highest-numbered checkpoint
+# (validator/evaluation/evaluators/diffusion.py:98-134). Neither of those is "the
+# best checkpoint" -- both are "the newest one". At ~1.8 s/step nobody finishes
+# the template's step budget inside a 45-minute task, so what ships is wherever
+# the wall happened to land, while the scored optimum sits mid-schedule: training
+# keeps improving the train loss well after the blank-prompt reconstruction the
+# eval weights 0.75 has already turned.
+#
+# The champion repo published for this round runs exactly this pass for
+# qwen-image and sdxl and NOT for krea2/ideogram4 (its image_trainer.py's
+# `_dyn_selectable`), i.e. on the two families that carry the boss round it
+# promotes the newest save like everyone else. This is that missing pass, on the
+# objective the validator actually uses.
+CKPT_MAX_CANDIDATES = 4
+
+# Same asymmetry as MIN_REWRITE_GAIN: what trained is the known quantity, so a
+# different checkpoint only takes the submission slot when it wins by more than
+# a seed draw can invent.
+CKPT_MIN_GAIN = 0.01
+
+
+def numbered_checkpoints(training_folder: str) -> list[tuple[int, str]]:
+    """(step, path) for every numbered save under the folder, oldest first."""
+    import re
+
+    found: list[tuple[int, str]] = []
+    for path in glob.glob(os.path.join(training_folder, "**", "*.safetensors"),
+                          recursive=True):
+        match = re.search(r"[-_](\d+)\.safetensors$", os.path.basename(path))
+        if match:
+            found.append((int(match.group(1)), path))
+    return sorted(found)
+
+
+def thin(candidates: list, limit: int) -> list:
+    """`limit` saves spread across the run, the newest always kept.
+
+    Spread rather than the newest N: the optimum is a minimum somewhere in the
+    middle of the schedule, and the newest N of a dense grid all sit on the same
+    side of it -- they would measure the same wrong answer four times.
+    """
+    if limit <= 0 or not candidates:
+        return []
+    if len(candidates) <= limit:
+        return list(candidates)
+    stride = (len(candidates) - 1) / float(limit - 1) if limit > 1 else 0.0
+    picked = {int(round(i * stride)) for i in range(limit)}
+    picked.add(len(candidates) - 1)
+    return [candidates[i] for i in sorted(picked)]
+
+
+def select_checkpoint(training_folder: str, dataset_dir: str, base_model_path: str,
+                      model_kwargs: dict, deadline: float,
+                      scorer: "_Scorer | None" = None) -> "_Scorer | None":
+    import torch
+
+    shipping = find_submission(training_folder)   # what goes up if we do nothing
+    if shipping is None:
+        log("no submission on disk; nothing to select from")
+        return scorer
+    grid = numbered_checkpoints(training_folder)
+    candidates = [(step, path) for step, path in thin(grid, CKPT_MAX_CANDIDATES)
+                  if os.path.realpath(path) != os.path.realpath(shipping)]
+    if not candidates:
+        log("only one checkpoint on disk; submitting as trained")
+        return scorer
+    if time.time() + SAFETY_MARGIN_S >= deadline:
+        log("no budget left for selection; submitting as trained")
+        return scorer
+
+    scorer = scorer or _Scorer(dataset_dir, base_model_path, model_kwargs)
+    budget = deadline - SAFETY_MARGIN_S
+
+    def measure(path: str) -> tuple[float, float]:
+        deltas = load_lora(path, scorer.device, torch.float32)
+        try:
+            return scorer.score(
+                lambda: apply_lora(scorer.model, deltas, 1.0, 1.0, sign=1.0),
+                lambda: apply_lora(scorer.model, deltas, 1.0, 1.0, sign=-1.0),
+            )
+        finally:
+            # A full fp32 copy of the adapter, on the GPU. Clearing it (rather
+            # than waiting for the next rebind) is the difference between a
+            # four-checkpoint pass and an OOM three checkpoints in.
+            deltas.clear()
+            torch.cuda.empty_cache()
+
+    # The file that would ship anyway is the control: both the score to beat and
+    # the structure bar, exactly as in the strength search.
+    control, control_structure = measure(shipping)
+    log(f"as-trained {os.path.basename(shipping)} weighted={control:.6f} "
+        f"structure={control_structure:.2f} ({scorer.per_candidate:.0f}s)")
+
+    scored: dict[int, float] = {}
+    best_step, best_path, best = None, None, control
+    for step, path in candidates:
+        if not scorer.fits(budget):
+            log(f"deadline: stopping before step-{step}")
+            break
+        weighted, ratio = measure(path)
+        log(f"step-{step} weighted={weighted:.6f} structure={ratio:.2f} "
+            f"({scorer.per_candidate:.0f}s)")
+        if control_structure and ratio < STRUCTURE_FLOOR * control_structure:
+            # Flattened image scoring well on pixel MSE -- the same degenerate
+            # optimum the strength search walks into, and just as unselectable.
+            log(f"  rejected: structure {ratio:.2f} < "
+                f"{STRUCTURE_FLOOR:.2f} x {control_structure:.2f} (as-trained)")
+            continue
+        scored[step] = weighted
+        if weighted < best:
+            best_step, best_path, best = step, path, weighted
+
+    if best_path is None:
+        log("no checkpoint beat the as-trained artefact; submitting as trained")
+        return scorer
+    gain = (control - best) / control
+    if gain < CKPT_MIN_GAIN:
+        log(f"best step-{best_step} gain {100 * gain:.2f}% below the "
+            f"{100 * CKPT_MIN_GAIN:.0f}% threshold; submitting as trained")
+        return scorer
+
+    # The evaluator picks the file named exactly last.safetensors, so selection
+    # means putting the winner THERE. Keep the loser as .preselect (not a
+    # .safetensors, or the uploader would ship it as a submission too).
+    target = os.path.join(os.path.dirname(shipping), "last.safetensors")
+    if os.path.exists(target):
+        shutil.copy2(target, target + ".preselect")
+    shutil.copy2(best_path, target)
+    log(f"selected step-{best_step} ({100 * gain:.2f}% better than as-trained) -> {target}")
+    with open(os.path.join(training_folder, "selection.json"), "w") as fh:
+        json.dump({"control": control, "control_file": os.path.basename(shipping),
+                   "grid": {str(k): v for k, v in scored.items()},
+                   "chosen_step": best_step, "gain_pct": round(100 * gain, 3)}, fh, indent=2)
+    return scorer
+
 def calibrate(training_folder: str, dataset_dir: str, base_model_path: str,
-              model_kwargs: dict, deadline: float) -> None:
+              model_kwargs: dict, deadline: float,
+              scorer: "_Scorer | None" = None) -> None:
     submission = find_submission(training_folder)
     if submission is None:
         log("no last.safetensors under the training folder; nothing to calibrate")
@@ -392,7 +558,7 @@ def calibrate(training_folder: str, dataset_dir: str, base_model_path: str,
         return
 
     results = score_candidates(submission, dataset_dir, base_model_path,
-                               model_kwargs, deadline - SAFETY_MARGIN_S)
+                               model_kwargs, deadline - SAFETY_MARGIN_S, scorer=scorer)
     if (1.0, 1.0) not in results or len(results) < 2:
         log("control or every candidate missing; submitting as trained")
         return
@@ -427,12 +593,28 @@ def main() -> int:
                         help="JSON: text_encoder_path/vae_path the trainer resolved")
     parser.add_argument("--deadline-epoch", type=float, required=True,
                         help="unix time the whole job must be done by")
+    # WHICH checkpoint ships, then AT WHAT STRENGTH -- in that order, because the
+    # strength search answers a question about one artefact and the answer does
+    # not transfer to a different one. Both passes are optional and each stops on
+    # its own deadline check, so a slow GPU degrades to fewer passes, never to a
+    # missed upload.
+    parser.add_argument("--mode", default="select+calibrate",
+                        choices=["select", "calibrate", "select+calibrate"])
     args = parser.parse_args()
-    try:
-        calibrate(args.training_folder, args.dataset_dir, args.base_model,
-                  json.loads(args.model_kwargs), args.deadline_epoch)
-    except Exception as exc:  # noqa: BLE001 -- fail-open is the contract
-        log(f"calibration failed, submitting as trained: {exc!r}")
+    model_kwargs = json.loads(args.model_kwargs)
+    scorer = None
+    if "select" in args.mode:
+        try:
+            scorer = select_checkpoint(args.training_folder, args.dataset_dir,
+                                       args.base_model, model_kwargs, args.deadline_epoch)
+        except Exception as exc:  # noqa: BLE001 -- fail-open is the contract
+            log(f"selection failed, keeping the trained artefact: {exc!r}")
+    if "calibrate" in args.mode:
+        try:
+            calibrate(args.training_folder, args.dataset_dir, args.base_model,
+                      model_kwargs, args.deadline_epoch, scorer=scorer)
+        except Exception as exc:  # noqa: BLE001 -- fail-open is the contract
+            log(f"calibration failed, submitting as trained: {exc!r}")
     return 0
 
 
