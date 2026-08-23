@@ -1,4 +1,51 @@
-# SN56 image tournament trainer
+# SN56 tournament trainer
+
+Trainers for the Gradients image and text tournaments. Each lane lists its
+base and the mechanisms carried beyond that base.
+
+## Text trainer
+
+`dockerfiles/standalone-text-trainer.dockerfile` + `scripts/`. Base: the
+published winning repository of tournament `tourn_20f928c9169811d7_20260810`
+(tournament winners are published by design; the tree is vendored verbatim in
+one commit so every change below is an attributable diff). Mechanisms on top,
+all enabled by default on the instruct/chat training path:
+
+- **Best-fit-decreasing sample packing**
+  (`scripts/monkeypatch.py:pack_data_points_by_length`): the base packs with
+  Next-Fit — one open bin, closed forever on the first item that does not fit.
+  Replaced with best-fit-decreasing under the same contract (index groups,
+  `max_size`, over-length singletons). Measured on real tournament data
+  (kobprof/skolegpt-instruct, tinyllama tokenizer, 20k rows): 25.0% / 18.3% /
+  10.5% fewer bins at max_length 1024/2048/4096, within 0.1-0.8% of the
+  ceil(sum/max_length) floor. The budget is wall-clock, so fewer bins is
+  directly more optimizer steps per task.
+
+- **Packed-path truncation guard** (`scripts/monkeypatch.py:PackedDataset`):
+  the base's OOM ladder halves `max_length` in the request without
+  re-tokenizing; items tokenized under the old limit then trip the packing
+  length assert on every remaining retry and the run falls through to the
+  noise-model hedge. `PackedDataset` now prompt-side-truncates any over-length
+  item at collection time. A no-op in normal runs.
+
+- **Adaptive max_length ceiling + effective-batch repair**
+  (`scripts/adaptive_max_length.py`, `scripts/instruct_config.py`): the
+  adaptive context sizing used the model's full `max_position_embeddings` as
+  its ceiling — a long-tailed dataset on a long-context model pushed
+  max_length into the tens of thousands and collapsed the batch to 1. Capped
+  at 8192. When the batch is rescaled for a grown context, gradient
+  accumulation is now re-derived so the effective batch stays at the target
+  of 64 instead of silently shrinking with the rescale.
+
+- **Budget-aware gradient checkpointing** (`scripts/instruct_config.py`,
+  `scripts/text_trainer.py`): the base hardcodes gradient checkpointing on
+  for every instruct run; on sub-2B models with headroom to spare the
+  recompute is pure step-time overhead. It is now disabled only when
+  params < 2B, max_length ≤ 2048, no KL regularization (the frozen base
+  replica doubles the footprint), and ≥ 70GB VRAM. On OOM the retry ladder
+  re-enables it before touching the batch size.
+
+## Image trainer
 
 Diffusion LoRA trainer for the Gradients image tournament, built on the
 ai-toolkit training stack. Mechanisms beyond the baseline:
@@ -38,7 +85,7 @@ routes flux tasks through the same container and entrypoint, and
 
 ## Integrity
 
-Both mechanisms operate only on this job's own inputs and outputs. The training
+All mechanisms in both lanes operate only on the job's own inputs and outputs. The training
 container is given a base model and a dataset by the validator and has no network
 egress; nothing in this repository fetches an external dataset, benchmark or
 evaluation data, or an external pretrained model or adapter, and nothing touches
