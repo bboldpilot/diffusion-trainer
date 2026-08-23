@@ -190,11 +190,27 @@ def run_training(
             if os.path.exists(log_path):
                 error_type = get_error_type(log_path)
                 if error_type == OOM_ERROR:
+                    # If the budget-aware config turned gradient checkpointing
+                    # off, restore it before touching the batch size: GC buys
+                    # back far more memory than one halving, and keeping the
+                    # planned batch preserves the effective-batch target. This
+                    # attempt retries with GC on and the batch untouched; the
+                    # halving ladder below stays available for later attempts.
+                    current_gc = extract_value_from_cmd(train_cmd, "gradient_checkpointing")
                     current_batch_size = extract_value_from_cmd(
                         train_cmd, "per_device_train_batch_size"
                     )
                     current_batch_size = int(current_batch_size)
-                    if current_batch_size > 1:
+                    if current_gc == "False":
+                        print(
+                            "[sn56][oom-fallback] re-enabling gradient_checkpointing "
+                            "before reducing batch size",
+                            flush=True,
+                        )
+                        train_cmd = replace_args_in_cmd(
+                            train_cmd, "gradient_checkpointing", "True"
+                        )
+                    elif current_batch_size > 1:
                         new_batch_size = current_batch_size // 2
                         print(
                             f"Reducing batch size from {current_batch_size} to {new_batch_size}",

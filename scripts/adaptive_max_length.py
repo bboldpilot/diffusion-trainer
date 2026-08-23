@@ -18,6 +18,9 @@ _MIN_MAX_LENGTH = 128
 # GPU-friendly alignment (memory allocation granularity).
 _ALIGNMENT = 64
 
+# Absolute ceiling regardless of the model's context window; see compute_max_length.
+_ABS_MAX_LENGTH = 8192
+
 
 def _align_up(value: int, alignment: int = _ALIGNMENT) -> int:
     """Round up to the nearest multiple of alignment."""
@@ -81,6 +84,13 @@ def compute_max_length(
     ceiling = default
     if model_max_length is not None and model_max_length > default:
         ceiling = model_max_length
+
+    # Absolute cap. Without it, a long-tailed dataset on a long-context model
+    # (max_position_embeddings 32k-128k) pushes max_length into the tens of
+    # thousands; the batch-size rescale downstream then collapses batch to 1
+    # and the run dies by throughput, not by truncation. 8192 covers every
+    # realistic tournament task while bounding the rescale at 4x.
+    ceiling = min(ceiling, _ABS_MAX_LENGTH)
 
     # Clamp to [_MIN_MAX_LENGTH, ceiling].
     target = max(_MIN_MAX_LENGTH, min(target, ceiling))

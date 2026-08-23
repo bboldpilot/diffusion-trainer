@@ -6,6 +6,7 @@ from model_utility import (
     get_data_size,
     get_gpu_count,
 )
+import os
 from copy import deepcopy
 from lr_finder import estimate_starting_lr
 from adaptive_max_length import compute_max_length
@@ -313,13 +314,52 @@ def get_training_json(train_info: dict) -> dict:
             ratio = default_max / max_length
             old_bs = run_config["batch_size"]
             run_config["batch_size"] = max(1, int(old_bs * ratio))
+            # Re-derive gradient accumulation for the shrunken batch. Without
+            # this the GA computed above stays pinned to the pre-rescale batch
+            # and the effective batch silently drops below the 64 target
+            # (e.g. bs 100 -> 25 with GA still 1 = effective 25).
+            data_per_step = run_config["batch_size"] * run_config["gpu_nums"]
+            if data_per_step >= 64:
+                run_config["gradient_accumulation_steps"] = 1
+            else:
+                run_config["gradient_accumulation_steps"] = -(-64 // data_per_step)
             print(
                 f"[instruct_config] max_length {default_max} -> {max_length}, "
-                f"batch_size {old_bs} -> {run_config['batch_size']}",
+                f"batch_size {old_bs} -> {run_config['batch_size']}, "
+                f"grad_accum -> {run_config['gradient_accumulation_steps']}",
                 flush=True,
             )
     else:
         max_length = None
+
+    # Budget-aware gradient checkpointing. GC recompute costs 20-40% step time
+    # and on small models it buys memory the run does not need: the sub-2B
+    # buckets ship batch sizes of 100-140 on 80GB cards with room to spare
+    # (the DPO configs already run their small buckets with GC off). Keep it
+    # ON whenever anything raises real memory pressure: bigger models, a grown
+    # context, a KL run (the frozen base replica roughly doubles the footprint),
+    # or a card smaller than the tournament's 80GB. The OOM retry ladder in
+    # text_trainer re-enables GC before it starts halving the batch, so the
+    # failure mode is one wasted attempt, not a lost run.
+    effective_max_length = max_length if max_length is not None else 2048
+    try:
+        import torch
+        total_vram = torch.cuda.get_device_properties(0).total_memory
+    except Exception:
+        total_vram = 0
+    if (
+        param_nums < 2_000_000_000
+        and effective_max_length <= 2048
+        and os.environ.get("USE_KL") != "1"
+        and total_vram >= 70e9
+    ):
+        run_config["gradient_checkpointing"] = "False"
+        print(
+            f"[instruct_config] gradient_checkpointing off "
+            f"(params={param_nums}, max_length={effective_max_length}, "
+            f"vram={total_vram / 1e9:.0f}GB)",
+            flush=True,
+        )
 
     run_config["learning_rate"] *= train_info["reg_ratio"]
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
