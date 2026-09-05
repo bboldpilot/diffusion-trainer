@@ -42,12 +42,15 @@ config:
     train:
       batch_size: 1
       bypass_guidance_embedding: false
-      # 3000, not the stock 2000: on the boss-round krea2 task the eval score
-      # improves monotonically through 2000 and a 3000-step run measured 7.7%
-      # better (5 seeds, same test set). The entrypoint guards the wall clock:
-      # if the budget runs out first, the highest saved checkpoint is promoted,
-      # so extra steps can only help.
-      steps: 3000
+      # 2400, not the stock 2000: on the boss-round krea2 task the eval score
+      # improves monotonically through 2000 (a 3000-step run measured 7.7% better
+      # than 2000, 5 seeds, same test set), but the 15-checkpoint sweep of that run
+      # put the optimum at step 2400, 6.2% better than the step-3000 final. Stopping
+      # there hands the ~600 freed seconds to the checkpoint-selection pass, which
+      # picks among the tail saves on the eval's own objective. The entrypoint
+      # guards the wall clock: if the budget runs out first, the highest saved
+      # checkpoint is promoted, so a cut run still ships.
+      steps: 2400
       gradient_accumulation: 1
       train_unet: true
       train_text_encoder: false

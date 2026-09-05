@@ -60,6 +60,15 @@ all enabled by default on the instruct/chat training path:
   the 4.x tokenization step, which covers the `llama`/`granite`-typed 2026 models
   that do load on 4.x.
 
+- **krea2 checkpoint selection on the eval objective** (`ops/docker/scripts/
+  lora_calibration.py`, `image_toolkit_entrypoint.py`): the final save is not the
+  best save (15-checkpoint sweep: optimum at step 2400 of 3000, 6.2% better than
+  the shipped final). The post-training pass now scores the tail checkpoints
+  (newest first, 4 images x 1 seed, eval-exact img2img settings) inside a reserve
+  scaled to the task budget and ships the minimum when it beats as-trained by
+  >1%; strength calibration follows with the remaining budget. Fail-open, atomic
+  rename, training images only, no network.
+
 ## Image trainer
 
 Diffusion LoRA trainer for the Gradients image tournament, built on the

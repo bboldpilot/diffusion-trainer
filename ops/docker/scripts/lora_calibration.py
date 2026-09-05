@@ -131,7 +131,11 @@ STRUCTURE_FLOOR = 0.90       # fraction of the as-trained structure a candidate 
 
 # Never start a candidate whose projected finish would cross the deadline; the
 # margin covers decode + rewrite + the uploader needing the disk.
-SAFETY_MARGIN_S = 240
+# Time kept free at the end of the job for the copy/rename of the winner and the
+# harness upload. Was 240 s; a full 7xx MB copy + rename takes seconds, and the
+# entrypoint's own wall guard means an overrun is not fatal -- the artefact on disk
+# is always a complete file (the rewrite below is copy-then-atomic-rename).
+SAFETY_MARGIN_S = 150
 
 
 def eval_seeds(n: int, master_seed: int = 42) -> list[int]:
@@ -424,7 +428,20 @@ def find_submission(training_folder: str) -> str | None:
 # `_dyn_selectable`), i.e. on the two families that carry the boss round it
 # promotes the newest save like everyone else. This is that missing pass, on the
 # objective the validator actually uses.
-CKPT_MAX_CANDIDATES = 4
+CKPT_MAX_CANDIDATES = 5
+# Candidates come from the tail of the run, newest first. Measured on the boss-round
+# krea2 task (15-checkpoint sweep, validator seeds): the optimum sat at step 2400 of
+# 3000, 6.2% better than the final save; spreading four candidates across the whole
+# run measured steps 200/1133/2066 and never reached it. The last CKPT_TAIL_FRACTION of
+# the run holds the minimum; ordering newest-first means a deadline stop still leaves
+# the most plausible candidates measured.
+CKPT_TAIL_FRACTION = 0.4
+# Scoring budget per candidate: the eval uses 5 seeds, but inside a reserve measured in
+# minutes 4 images x 2 seeds cost 151 s on an H100 and left room for one candidate.
+# 4 images x 1 seed halves that; selection needs ranking, not the absolute score, and
+# CKPT_MIN_GAIN still guards against a seed-draw win.
+SELECT_IMAGES = int(os.environ.get("SELECT_IMAGES", "4"))
+SELECT_SEEDS = int(os.environ.get("SELECT_SEEDS", "1"))
 
 # Same asymmetry as MIN_REWRITE_GAIN: what trained is the known quantity, so a
 # different checkpoint only takes the submission slot when it wins by more than
@@ -472,8 +489,13 @@ def select_checkpoint(training_folder: str, dataset_dir: str, base_model_path: s
         log("no submission on disk; nothing to select from")
         return scorer
     grid = numbered_checkpoints(training_folder)
-    candidates = [(step, path) for step, path in thin(grid, CKPT_MAX_CANDIDATES)
-                  if os.path.realpath(path) != os.path.realpath(shipping)]
+    last_step = grid[-1][0] if grid else 0
+    tail_from = (1.0 - CKPT_TAIL_FRACTION) * last_step
+    candidates = [(step, path) for step, path in reversed(grid)
+                  if step >= tail_from
+                  and os.path.realpath(path) != os.path.realpath(shipping)][:CKPT_MAX_CANDIDATES]
+    log(f"grid {len(grid)} saves up to step-{last_step}; candidates (newest first): "
+        f"{[step for step, _ in candidates]}")
     if not candidates:
         log("only one checkpoint on disk; submitting as trained")
         return scorer
@@ -481,7 +503,8 @@ def select_checkpoint(training_folder: str, dataset_dir: str, base_model_path: s
         log("no budget left for selection; submitting as trained")
         return scorer
 
-    scorer = scorer or _Scorer(dataset_dir, base_model_path, model_kwargs)
+    scorer = scorer or _Scorer(dataset_dir, base_model_path, model_kwargs,
+                               SELECT_IMAGES, SELECT_SEEDS)
     budget = deadline - SAFETY_MARGIN_S
 
     def measure(path: str) -> tuple[float, float]:
@@ -538,7 +561,11 @@ def select_checkpoint(training_folder: str, dataset_dir: str, base_model_path: s
     target = os.path.join(os.path.dirname(shipping), "last.safetensors")
     if os.path.exists(target):
         shutil.copy2(target, target + ".preselect")
-    shutil.copy2(best_path, target)
+    # copy to a sibling temp name, then atomic rename: the wall may kill this container
+    # at any instant and the uploader must never find a half-written last.safetensors.
+    tmp = target + ".tmp"
+    shutil.copy2(best_path, tmp)
+    os.replace(tmp, target)
     log(f"selected step-{best_step} ({100 * gain:.2f}% better than as-trained) -> {target}")
     with open(os.path.join(training_folder, "selection.json"), "w") as fh:
         json.dump({"control": control, "control_file": os.path.basename(shipping),

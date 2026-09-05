@@ -35,6 +35,19 @@ KREA2_TEXT_ENCODER_CACHE = CACHE_ROOT / "hf_cache" / "Qwen--Qwen3-VL-4B-Instruct
 # needs room for the post-train calibration, every other type just needs enough
 # for the SIGTERM -> checkpoint-promote path below.
 CALIBRATION_RESERVE_S = 420
+# The krea2 post-training pass (checkpoint selection + strength calibration) gets a
+# reserve that scales with the task: 20% of the budget, never below the 420 s the
+# calibration-only pass was measured in, never above 12 min. At 1.0 h that is 720 s:
+# with SELECT_IMAGES x SELECT_SEEDS = 4 gens (~75 s on H100) it fits the as-trained
+# control plus 4-5 tail checkpoints; the 600 training steps it costs are the ones the
+# 15-checkpoint sweep showed to be past the optimum (best step 2400 of 3000).
+SELECT_RESERVE_MAX_S = 720
+SELECT_RESERVE_FRACTION = 0.20
+
+
+def krea2_reserve_s(hours_to_complete: float) -> int:
+    budget = hours_to_complete * 3600.0
+    return int(min(SELECT_RESERVE_MAX_S, max(CALIBRATION_RESERVE_S, SELECT_RESERVE_FRACTION * budget)))
 
 # WHICH post-training pass krea2 gets. "calibrate" is what is measured today
 # (dropping the text-fusion group won all six paired comparisons, 1.0-4.0%).
@@ -43,11 +56,12 @@ CALIBRATION_RESERVE_S = 420
 # on. Both share one model load, and selection runs first because a strength
 # measured on one checkpoint says nothing about another.
 #
-# It ships as "calibrate" until the harness run has priced the two against each
-# other inside this reserve -- selection eats the budget calibration needs, and
-# trading a measured 1-4% for an unmeasured pass is the trade this workspace
-# keeps writing down as a mistake. Flip the constant, do not add a fallback.
-POST_TRAIN_MODE = "calibrate"
+# Shipped as "calibrate" while selection did not fit the 420 s reserve (measured:
+# the control score alone took 151 s at 4 images x 2 seeds). With the tail-window
+# candidates, 1-seed scoring and the scaled reserve (krea2_reserve_s) selection runs
+# first and calibration takes whatever budget is left; both stop on their own
+# deadline checks and fail open to the as-trained artefact.
+POST_TRAIN_MODE = "select+calibrate"
 PROMOTE_RESERVE_S = 120
 TERM_GRACE_S = 30
 
@@ -305,7 +319,8 @@ def main() -> None:
     # evaluator to pick up.
     training_folder = CHECKPOINTS_ROOT / args.task_id
     output_folder = training_folder / args.expected_repo_name
-    reserve = CALIBRATION_RESERVE_S if args.model_type == "krea2" else PROMOTE_RESERVE_S
+    reserve = krea2_reserve_s(float(args.hours_to_complete)) if args.model_type == "krea2" else PROMOTE_RESERVE_S
+    print(f"[wall] budget {float(args.hours_to_complete):.2f}h, post-training reserve {reserve}s", flush=True)
     run_training(config_path, deadline - reserve)
     # Post-training steps must never be the reason a trained artefact fails to ship. The
     # harness marks a task FAILED and uploads NOTHING when this container exits non-zero,
