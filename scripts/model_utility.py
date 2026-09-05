@@ -189,10 +189,12 @@ def get_gradient_checkpointing(model: str) -> str:
 
 
 def fix_tokenizer_config(model_path: str) -> bool:
-    """Fix extra_special_tokens list-vs-dict incompatibility in tokenizer_config.json.
+    """Normalise a tokenizer_config.json written by transformers 5 for a v4 loader.
 
-    Models saved with transformers v5 write extra_special_tokens as a list,
-    which crashes transformers v4 (calls .keys() on it). Fix in-place before loading.
+    - extra_special_tokens is written as a list, which crashes v4 (calls .keys()).
+    - tokenizer_class may be "TokenizersBackend", a v5-only name for the generic fast
+      tokenizer; v4 knows it as PreTrainedTokenizerFast.
+    Fixed in-place before loading; a no-op for configs that need nothing.
     """
     if not isinstance(model_path, str) or not os.path.isdir(model_path):
         return False
@@ -205,21 +207,31 @@ def fix_tokenizer_config(model_path: str) -> bool:
     except Exception:
         return False
 
+    changed = []
+
     est = cfg.get("extra_special_tokens")
-    if not isinstance(est, list):
+    if isinstance(est, list):
+        if all(isinstance(x, str) for x in est):
+            cfg["extra_special_tokens"] = {x: x for x in est}
+        elif all(isinstance(x, dict) for x in est):
+            merged = {}
+            for d in est:
+                merged.update(d)
+            cfg["extra_special_tokens"] = merged
+        else:
+            cfg["extra_special_tokens"] = {}
+        changed.append("extra_special_tokens (list→dict)")
+
+    # transformers 5 writes its generic fast-tokenizer class name, which v4 does not
+    # have; the v4 equivalent wrapping the same tokenizer.json is PreTrainedTokenizerFast.
+    if cfg.get("tokenizer_class") == "TokenizersBackend":
+        cfg["tokenizer_class"] = "PreTrainedTokenizerFast"
+        changed.append("tokenizer_class (TokenizersBackend→PreTrainedTokenizerFast)")
+
+    if not changed:
         return False
 
-    if all(isinstance(x, str) for x in est):
-        cfg["extra_special_tokens"] = {x: x for x in est}
-    elif all(isinstance(x, dict) for x in est):
-        merged = {}
-        for d in est:
-            merged.update(d)
-        cfg["extra_special_tokens"] = merged
-    else:
-        cfg["extra_special_tokens"] = {}
-
-    print(f"[sn56] fixed extra_special_tokens (list→dict) in {cfg_path}", flush=True)
+    print(f"[sn56] fixed {', '.join(changed)} in {cfg_path}", flush=True)
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
     return True

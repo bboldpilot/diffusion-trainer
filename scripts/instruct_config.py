@@ -10,6 +10,7 @@ import os
 from copy import deepcopy
 from lr_finder import estimate_starting_lr
 from adaptive_max_length import compute_max_length
+from v5_lane import is_v5_lane, launcher
 
 
 FIXED_BS_CONFIG = {
@@ -139,12 +140,9 @@ def get_run_cmd(config: dict, gpu_nums: int):
             raise ValueError(f"Required key {key} not found in config")
 
     gpu_nums = get_gpu_count()
-    start_cmd = "python"
     run_type = config["distributed"]
-    if gpu_nums > 1 and run_type == "ddp":
-        start_cmd = f"torchrun --nproc_per_node={gpu_nums}"
-    elif run_type == "ds":
-        start_cmd = f"deepspeed"
+    # python / torchrun / deepspeed from PATH, or the v5 venv interpreter inside the lane.
+    start_cmd = launcher(gpu_nums, run_type)
 
     template = (
         start_cmd
@@ -234,6 +232,27 @@ def get_training_json(train_info: dict) -> dict:
         run_config["packing_mode"] = "naive"
     else:
         run_config["packing_mode"] = "fa"
+
+    # v5 lane (transformers 5 side venv, see v5_lane.py): conservative defaults.
+    # The Flash-Attention varlen packing monkeypatch is validated on 4.x only, so
+    # attention falls back to sdpa and packing is off unless a smoke test says
+    # otherwise (SN56_V5_ATTN / SN56_V5_PACKING). Without packing every sample is
+    # padded to max_length, so the per-device batch is capped (SN56_V5_MAX_BS) and
+    # the effective batch is restored through gradient accumulation below.
+    if is_v5_lane():
+        run_config["use_attn_implementation"] = os.environ.get("SN56_V5_ATTN", "sdpa")
+        run_config["packing"] = os.environ.get("SN56_V5_PACKING", "False")
+        if run_config["packing"] != "True":
+            try:
+                v5_max_bs = int(os.environ.get("SN56_V5_MAX_BS", "8"))
+            except ValueError:
+                v5_max_bs = 8
+            run_config["batch_size"] = max(1, min(run_config["batch_size"], v5_max_bs))
+        print(
+            f"[sn56][v5-lane] attn={run_config['use_attn_implementation']} "
+            f"packing={run_config['packing']} batch_size={run_config['batch_size']}",
+            flush=True,
+        )
 
     # data_size = get_data_size(train_info["request_path"])
 

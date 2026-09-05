@@ -31,6 +31,7 @@ import bitsandbytes as bnb
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import yaml
 from state_manager import get_state, set_state
+from v5_lane import dtype_kw, trainer_tokenizer_kw
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 
@@ -110,7 +111,7 @@ def load_lora_model(training_args: TrainingArguments, model_path: str, lora_args
     model = model_class.from_pretrained(
         model_path,
         attn_implementation="flash_attention_2" if not training_args.disable_fa else "eager",
-        torch_dtype=torch.bfloat16,
+        **dtype_kw(torch.bfloat16),
         quantization_config=(
             BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -179,7 +180,7 @@ def load_model(training_args: TrainingArguments, model_path: str, token_nums: in
     model = model_class.from_pretrained(
         model_path,
         # trust_remote_code=True, remove this because we already filter the model architecture, it will not be used with liger-kernel 
-        torch_dtype=torch.bfloat16,
+        **dtype_kw(torch.bfloat16),
         attn_implementation=attn_implementation,
     )
     # model.resize_token_embeddings(token_nums)
@@ -512,7 +513,7 @@ def main():
     )
     _trainer_kwargs = dict(
         model=model,
-        tokenizer=tokenizer,
+        **trainer_tokenizer_kw(tokenizer),
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=dev_ds,
@@ -538,7 +539,11 @@ def main():
 
     if ckpt_avg is not None:
         ckpt_avg.trainer = trainer
-    trainer.tokenizer = tokenizer
+    try:
+        trainer.tokenizer = tokenizer
+    except AttributeError:
+        # transformers 5 exposes the tokenizer as processing_class only
+        pass
 
     # ── Estimate dataset coverage (rough; refined with real timing below) ──
     # Coverage = how much of one epoch we can train in the budget. Drives

@@ -45,6 +45,21 @@ all enabled by default on the instruct/chat training path:
   replica doubles the footprint), and ≥ 70GB VRAM. On OOM the retry ladder
   re-enables it before touching the batch size.
 
+- **v5 lane for 2026+ architectures** (`scripts/v5_lane.py`,
+  `dockerfiles/standalone-text-trainer.dockerfile`): round 1 now always plays one
+  task on a 2026 release (Qwen3.5, gemma-4, LFM2.5, granite-4.1, MiniCPM5). The
+  validator evaluates with transformers 5, but the pinned training stack
+  (transformers 4.51.3) cannot load qwen3_5 / gemma4 / lfm2 / lfm2_moe at all,
+  so the task fails before training starts. The image carries a second venv
+  with transformers 5.12.1 + peft 0.19.1 (system torch / flash-attn / bnb shared)
+  and `text_trainer` re-execs into it only when the task model's `model_type` is
+  unknown to the main install. Inside the lane attention is sdpa and packing is
+  off (the Flash-Attention varlen packing patch is validated on 4.x only); the
+  4.x path is byte-for-byte unchanged. Also normalises tokenizer configs written
+  by transformers 5 (`extra_special_tokens` list, `TokenizersBackend` class) for
+  the 4.x tokenization step, which covers the `llama`/`granite`-typed 2026 models
+  that do load on 4.x.
+
 ## Image trainer
 
 Diffusion LoRA trainer for the Gradients image tournament, built on the

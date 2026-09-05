@@ -38,6 +38,7 @@ import transformers
 from transformers import Trainer
 
 from utility import log_info
+from v5_lane import dtype_kw
 
 
 def load_base_model(
@@ -55,7 +56,7 @@ def load_base_model(
     """
     base = transformers.AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=dtype,
+        **dtype_kw(dtype),
         attn_implementation=attn_implementation,
     )
     base.to(device)

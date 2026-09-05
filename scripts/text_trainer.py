@@ -46,6 +46,8 @@ from grpo_config import get_training_json as get_grpo_training_json
 import pathlib
 from transformers import AutoConfig
 import lr_utils
+from model_utility import fix_tokenizer_config
+from v5_lane import is_v5_lane, maybe_reexec
 
 def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
     # print(f"Running command: {cmd}", flush=True)
@@ -428,8 +430,17 @@ def main():
     request_path = os.path.join(ds_folder, f"training_request_{args.task_id}.json")
     model_path = str(train_paths.get_text_base_model_path(original_model_name))
 
+    # v5 lane: architectures unknown to the pinned transformers (2026+ round-1
+    # models) run under the side venv — see v5_lane.py. Returns normally otherwise.
+    maybe_reexec(model_path, sys.argv)
+    if is_v5_lane():
+        print(f"[sn56][v5-lane] active: python={sys.executable}", flush=True)
+    # Tokenization runs in the axolotl venv (transformers 4.x); normalise
+    # tokenizer_config.json written by transformers 5 before it gets there.
+    fix_tokenizer_config(model_path)
+
     is_openai = False
-    if is_openai_model(original_model_name):
+    if is_openai_model(original_model_name) and not is_v5_lane():
         print("Upgrading python packages for openai model", flush=True)
         run_cmd_with_log(
             "pip uninstall -y transformers && pip install transformers==4.55.0",

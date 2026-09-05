@@ -8,10 +8,11 @@ from huggingface_hub import HfApi
 from transformers import AutoConfig
 import json 
 import datetime
+from v5_lane import dtype_kw
 # Configuration
 
 def main(model_path: str, save_folder: str):
-    model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, device_map="auto")
+    model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", **dtype_kw(torch.bfloat16))
     model.generation_config = GenerationConfig(temperature=None, top_p=None)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     noise_std = 0.01

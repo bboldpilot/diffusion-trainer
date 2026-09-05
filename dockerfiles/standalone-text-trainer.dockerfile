@@ -46,4 +46,18 @@ RUN pip install uv && \
     uv pip install vllm==0.8.3 --system && \
     pip install "fiber @ git+https://github.com/rayonlabs/fiber.git@2.4.0"
 
+# v5 lane (scripts/v5_lane.py): a side venv with transformers 5 for architectures the
+# pinned 4.51.3 cannot load (qwen3_5, gemma4, lfm2, lfm2_moe, ...). It shares the system
+# torch / flash-attn / bitsandbytes / deepspeed through --system-site-packages; only the
+# HF stack is overridden. text_trainer re-execs into it solely when the task model's
+# model_type is unknown to the main install; every other task is untouched.
+# Failure-tolerant on purpose: if this layer cannot be built the venv is removed and the
+# image still builds; text_trainer then finds no /workspace/v5_py and behaves as before.
+RUN (python -m venv --system-site-packages /workspace/v5_py && \
+     uv pip install --python /workspace/v5_py/bin/python \
+        "transformers==5.12.1" "peft==0.19.1" "tokenizers==0.22.2" \
+        "huggingface_hub>=1.5.0,<2.0" "accelerate==1.14.0" "datasets>=4.7,<6" && \
+     /workspace/v5_py/bin/python -c "import transformers, peft, torch; print('v5 lane:', transformers.__version__, peft.__version__, 'torch', torch.__version__)") \
+    || (echo "v5 lane venv build FAILED - continuing without it" && rm -rf /workspace/v5_py)
+
 ENTRYPOINT ["./entrypoint.sh"]
