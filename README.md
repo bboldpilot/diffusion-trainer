@@ -107,6 +107,67 @@ builds the toolkit-era model types, `ops/docker/standalone-image-trainer.dockerf
 routes flux tasks through the same container and entrypoint, and
 `core/training_templates/` carries the per-architecture training configs.
 
+Complete single-file FLUX checkpoints use `flux_single_file.py` and a build-time
+patch to the pinned toolkit loader. Transformer, CLIP, T5 and VAE weights all
+come from the task checkpoint; incomplete standalone files fail explicitly.
+Only architecture configs/tokenizers are baked from the Diffusers team's pinned
+FLUX packaging, with its BNB quantization settings removed. Existing Diffusers
+folders keep their loading path. A three-step GPU delivery smoke passed, followed
+by adapter reload (494/494 modules) and a finite latent forward pass. T5's shared
+embedding binding is restored after loading; any remaining meta tensor fails
+explicitly. Full task quality and actual Docker execution remain unverified. A run with no
+nonempty, evaluator-pickable checkpoint now exits with an error.
+
+### `IMG_RECIPE` — training recipe and holdout experiment
+
+The toolkit Docker image sets `IMG_RECIPE=winner`; the validator does not inherit
+environment variables used by our external replay harness. An explicit
+`IMG_RECIPE=ours` selects the original flow above. `IMG_RECIPE=winner`
+switches **krea2** and **ideogram4** to the effective recipe of the 2026-09-07 image
+winner (hotkey 5EhyCWPu; reconstruction in `../rivals-config/winner-0907-{krea2,ideogram4}.yaml`).
+Other model types log a notice and run ours. Every winner-only step is fail-open: on any
+error the run prints `[recipe] WARN ...` and continues on ours (captions re-blanked,
+select+calibrate re-enabled).
+
+* krea2: captions kept verbatim with `caption_dropout_rate 0.20` (no blanking), steps 2000,
+  `optimal_noise_pairing_samples 4`, multires noise 6/0.3, `KREA2_MODLORA=1` (LoRA also on
+  `tproj` + `last.linear`), deadline-anneal (cosine to x0.05 over the last 30 % of the
+  forecast, ending at wall-120 s), tail-save densify (every 50 steps in the last 10 %,
+  target wall-300 s). Training stops at wall-120 s (`WINNER_WALL_MARGIN_S`), the latest
+  complete save is promoted, **no** select/calibrate pass. The winner's `KREA2_STEPS`,
+  `KREA2_NPAIR`, `KREA2_MRN`, `KREA2_MRN_DISC`, `KREA2_CAPDROP`, `KREA2_ANNEAL`,
+  `KREA2_ANNEAL_FRAC`, `KREA2_ANNEAL_FLOOR`, `KREA2_MODLORA` env knobs work as in its `krea.py`.
+* ideogram4: CONTENT school -- lr 4e-4 (`unet_lr` too), `min_denoising_steps 250`,
+  balanced/linear, EMA 0.995, TE frozen with cached embeddings, `cache_latents_to_disk`,
+  dropout 0.05, save every 100, tail-save densify, `do_cfg`/`cfg_scale`/`text_encoder_lr`
+  removed; steps = `max(120, min(1700, (remaining-420)/2.1, 25*n_images))` computed at
+  start; `unconditional_lora_path` kept only if the file is staged. The DETAIL (line-art)
+  school is not ported (the winner's category vote is logged for reference). The winner's
+  `IMG_LR`, `IMG_STEPS`, `IMG_EMA`, `IMG_MIN_DENOISE`, `IMG_MAX_DENOISE`,
+  `IMG_CONTENT_STYLE`, `IMG_TIMESTEP`, `IMG_TRAIN_TE`, `IMG_TE_LR`, `IMG_NETWORK_ALPHA`,
+  `IMG_CAPTION_DROPOUT` overrides apply as in its `ideogram.py`.
+* Patches: `ops/docker/patches/{multires_noise,mod_lora,deadline_anneal,tail_save_densify}.py`
+  (copied verbatim, origin header in each) are applied at build on the same ai-toolkit pin.
+  They are inert until a config key / env selects them, so `ours` is unaffected; a drifted
+  anchor only prints a warning at build and the entrypoint drops that mechanism's keys at
+  runtime (`[recipe] patch <name>: applied|MISSING`).
+* The startup log prints `[recipe] effective config diff vs our template` (every changed key).
+  Without a GPU: `python3 ops/docker/scripts/recipe_dryrun.py --n 45 --hours 1.0 [--print-yaml]`.
+
+`IMG_RECIPE=winner+holdout` is experimental and is not the image default. On
+ideogram4, it removes up to eight image/caption pairs from training, divides the
+training budget between two candidates, and scores their adapters on the withheld
+images. Candidate step counts use the retained training-set size and measured
+training speed. On krea2 it preserves the single-run winner recipe and captions;
+flux, qwen-image and z-image keep their existing templates. The selector is included
+in the toolkit image, and selection failure falls back to the first trained adapter.
+
+This holdout mechanism uses only the task's supplied training data. The current
+in-container scorer is a proxy: its CFG and sigma schedule differ from the validator.
+An earlier agreement measured using the validator scorer on both data splits does
+not establish agreement for this implementation. Release requires candidate-ranking
+validation and a new end-to-end run after the recipe-dispatch correction.
+
 ## Integrity
 
 All mechanisms in both lanes operate only on the job's own inputs and outputs. The training

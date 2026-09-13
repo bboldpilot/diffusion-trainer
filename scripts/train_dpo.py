@@ -190,7 +190,7 @@ def main():
             if quantization_config is not None
             else {"": device_string}
         )
-    if len(training_args.fsdp) > 0 or is_deepspeed_zero3_enabled():
+    if len(training_args.fsdp or []) > 0 or is_deepspeed_zero3_enabled():
         device_map = None
 
 
@@ -221,7 +221,7 @@ def main():
         model_class = transformers.AutoModelForCausalLM
 
     model = model_class.from_pretrained(train_request["model_path"], **model_kwargs)
-    if len(training_args.fsdp) > 0 or is_deepspeed_zero3_enabled():
+    if len(training_args.fsdp or []) > 0 or is_deepspeed_zero3_enabled():
         # set gradient checkpointing to True with use_reentrant=True for deepspeed
         log_info("checkpointing ativado com reentrada para deepspeed")
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': True})
@@ -327,7 +327,7 @@ def main():
     # Averaging mode: in-RAM window for non-sharded models that fit; disk
     # averaging for sharded / too-big (in-RAM snapshots are invalid sharded).
     _shard_ds = getattr(training_args, "deepspeed", None) is not None
-    _sharded = _shard_ds or len(training_args.fsdp) > 0
+    _sharded = _shard_ds or len(training_args.fsdp or []) > 0
     _trainable_bytes = sum(p.numel() for p in model.parameters() if p.requires_grad) * 2
     _avg_mode = "disk" if (_sharded or 6 * _trainable_bytes > 100e9) else "ram"
     log_info(f"[sn56][caldo] modo={_avg_mode} (treináveis={_trainable_bytes / 1e9:.0f}GB, sharded={_sharded})")

@@ -53,11 +53,18 @@ RUN pip install uv && \
 # model_type is unknown to the main install; every other task is untouched.
 # Failure-tolerant on purpose: if this layer cannot be built the venv is removed and the
 # image still builds; text_trainer then finds no /workspace/v5_py and behaves as before.
+# The venv's own pip, NOT uv: uv resolves without the system site-packages, so it pulled a
+# fresh torch (2.14) next to the system 2.4.1 and the system torchvision/torchaudio/flash-attn
+# then failed to load inside the lane (transformers import died -> venv silently removed ->
+# a 2026+ round-1 task would have errored). pip sees the system torch and leaves it alone.
+# The import check covers torchvision because transformers imports it when present, and
+# bitsandbytes: transformers 5 gates bnb optimizers on bitsandbytes >= its minimum (the system
+# 0.45.4 is below it -> 'You need to install bitsandbytes' inside the lane, 10 Sep TR preflight).
 RUN (python -m venv --system-site-packages /workspace/v5_py && \
-     uv pip install --python /workspace/v5_py/bin/python \
+     /workspace/v5_py/bin/python -m pip install --no-cache-dir \
         "transformers==5.12.1" "peft==0.19.1" "tokenizers==0.22.2" \
-        "huggingface_hub>=1.5.0,<2.0" "accelerate==1.14.0" "datasets>=4.7,<6" && \
-     /workspace/v5_py/bin/python -c "import transformers, peft, torch; print('v5 lane:', transformers.__version__, peft.__version__, 'torch', torch.__version__)") \
+        "huggingface_hub>=1.5.0,<2.0" "accelerate==1.14.0" "datasets>=4.7,<6" "bitsandbytes>=0.46" && \
+     /workspace/v5_py/bin/python -c "import torch, torchvision, transformers, peft; from transformers.utils.import_utils import is_bitsandbytes_available as b; assert b(); print('v5 lane:', transformers.__version__, peft.__version__, 'torch', torch.__version__, 'bnb ok')") \
     || (echo "v5 lane venv build FAILED - continuing without it" && rm -rf /workspace/v5_py)
 
 ENTRYPOINT ["./entrypoint.sh"]

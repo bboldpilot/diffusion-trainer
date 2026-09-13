@@ -384,7 +384,7 @@ def main():
         if quantization_config is not None
         else {"": device_string}
     )
-    if len(training_args.fsdp) > 0 or is_deepspeed_zero3_enabled():
+    if len(training_args.fsdp or []) > 0 or is_deepspeed_zero3_enabled():
         device_map = None
     
     model_kwargs = dict(

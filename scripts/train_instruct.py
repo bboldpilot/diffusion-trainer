@@ -475,7 +475,7 @@ def main():
     # host RAM; disk-based averaging of consolidated checkpoints for sharded
     # (FSDP/DeepSpeed) or too-big models, where in-RAM snapshots are only shards.
     _shard_ds = getattr(training_args, "deepspeed", None) is not None
-    _sharded = _shard_ds or len(training_args.fsdp) > 0
+    _sharded = _shard_ds or len(training_args.fsdp or []) > 0
     _trainable_bytes = sum(p.numel() for p in model.parameters() if p.requires_grad) * 2
     # RAM peak holds ~6x trainable bytes (best + 3-window + avg + stash).
     _avg_mode = "disk" if (_sharded or 6 * _trainable_bytes > 100e9) else "ram"

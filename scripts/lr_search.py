@@ -40,6 +40,7 @@ References:
 """
 
 import gc
+import os
 import math
 import time
 from dataclasses import dataclass
@@ -136,7 +137,9 @@ _PRUNE_REL_STEP = 5        # relative prune is checked only at this step
 # ── Budget ──
 _TRAIN_UTIL = 0.85         # fraction of wall clock training actually uses
                            # (matches epoch planning in train_instruct.py)
-_SEARCH_FRACTION = 0.20    # the search may spend up to 20% of the total budget
+_SEARCH_FRACTION = float(os.environ.get("SN56_SEARCH_FRACTION", "0.20"))
+                           # the search may spend up to 20% of the total budget;
+                           # env override is a bench knob (T12), default unchanged
 _LEGACY_CAP_SECS = 20 * 60 # absolute cap for the legacy (no steps_per_epoch) path
 # The validation sweep (sub-1-epoch jobs) just vets the estimate for divergence,
 # so it gets its own cheaper step floor — it doesn't need S1's deeper horizon,
