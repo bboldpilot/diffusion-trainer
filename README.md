@@ -60,120 +60,57 @@ all enabled by default on the instruct/chat training path:
   the 4.x tokenization step, which covers the `llama`/`granite`-typed 2026 models
   that do load on 4.x.
 
-- **krea2 checkpoint selection on the eval objective** (`ops/docker/scripts/
-  lora_calibration.py`, `image_toolkit_entrypoint.py`): the final save is not the
-  best save (15-checkpoint sweep: optimum at step 2400 of 3000, 6.2% better than
-  the shipped final). The post-training pass now scores the tail checkpoints
-  (newest first, 4 images x 1 seed, eval-exact img2img settings) inside a reserve
-  scaled to the task budget and ships the minimum when it beats as-trained by
-  >1%; strength calibration follows with the remaining budget. Fail-open, atomic
-  rename, training images only, no network.
+## Image trainer — `imagelab/`
 
-## Image trainer
+Both image dockerfiles the validator builds (`ops/docker/standalone-image-toolkit-trainer.dockerfile`
+for ideogram4 / krea2 / qwen-image / z-image, `ops/docker/standalone-image-trainer.dockerfile` for flux)
+are identical and produce one image: ComfyUI at the evaluator's revision, torch 2.9.1 / cu128 and the
+evaluator's library pins, plus the `imagelab` package. `ENTRYPOINT python -m imagelab.entry` receives the
+validator's task flags. No ai-toolkit, no kohya.
 
-Diffusion LoRA trainer for the Gradients image tournament, built on the
-ai-toolkit training stack. Mechanisms beyond the baseline:
+imagelab trains a LoRA directly against the tournament's image metric (latent flow-velocity MSE over
+16 sigma strata, captioned and empty prompt weighted 0.5 / 0.5) inside ComfyUI's own model-loading and
+conditioning path, so training, internal selection and the evaluator share one numerical stack.
 
-- **krea2 prompt-encoding fix** (`ops/docker/patches/krea2_dynamic_prefix.py`):
-  the pinned trainer slices the tokenized system prefix with a fixed constant
-  that is only valid for one tokenizer serialization; the patch measures the
-  real prefix length at encode time so conditioning stays aligned (and the
-  empty-prompt unconditional pass stops producing zero tokens) whatever
-  Qwen3-VL snapshot is cached.
+- **Metric-identical objective** (`imagelab/objective.py`, `imagelab/data.py`): the evaluator's image
+  preparation (1024 long side, 16-px crop, posterior-mean VAE latents), its sigma grid, velocity target and
+  per-sample error; the base model is loaded the way the evaluator loads it (ideogram4: fp8 weights kept on
+  the fp8 grid).
+- **ComfyUI-native adapter** (`imagelab/adapter.py`): low-rank deltas applied through ComfyUI weight
+  wrappers (base weights frozen and untouched), exported with the key layout ComfyUI's LoRA loader applies.
+- **Holdout replica for checkpoint selection** (`imagelab/replica.py`, `imagelab/loop.py`): held-out
+  training images, chosen by a hash-ordered rule, are scored with the metric's structure; raw, EMA and
+  delta-averaged states compete, and the best is saved atomically from the first evaluation on.
+- **Cross-fit soup** (`--members K`, `imagelab/loop.py`; on for ideogram4, K = 4): the wall is split into
+  K slices; member k trains from a fresh initialisation with holdout fold k (rotating windows over the hash
+  order), every image is trained on by K-1 members, and the deltas of the members that beat their own base
+  are averaged exactly. The soup ships only if it beats the base on fold 0, otherwise the best single member.
+- **Budget and delivery** (`imagelab/entry.py`): training runs in a child process with a deadline 180 s
+  before the validator's kill; every save is mirrored into
+  `/app/checkpoints/<task_id>/<expected_repo_name>/last.safetensors` by rename, so a crash or a kill after
+  the first save still ships the latest adapter, and the container exits 0 whenever an adapter exists. The
+  trainer runs offline and never sees the validator's credentials.
 
-- **Post-training LoRA strength calibration**
-  (`ops/docker/scripts/lora_calibration.py`): after training, the LoRA's two
-  module groups (image-stream `blocks.*`, text-conditioning `txtfusion.*`) are
-  re-scored at a small grid of per-group strengths under the evaluation's own
-  img2img conditions, and the winning strengths are folded into the saved
-  weights. Budget-aware and fail-open: with no time left, or no measured
-  improvement, the artefact ships exactly as trained.
+Per-family hyperparameters live in `imagelab/recipes.py`. The VAE files the evaluator decodes with are
+baked at build time by `ops/docker/imagelab_assets.py` (fixed revisions, SHA-256 checked).
 
-- **Wall-clock guard** (`image_toolkit_entrypoint.py`): the harness kills the
-  training container at `hours_to_complete` exactly and uploads whatever is on
-  disk, but the trainer only writes the evaluator-preferred `last.safetensors`
-  on natural completion. The entrypoint stops training shortly before the wall
-  and promotes the highest settled checkpoint to that name, so a budget-bound
-  run still ships its best work instead of nothing.
+### ai-toolkit fallback (not built by the validator)
 
-- **Blank-prompt conditioning for krea2** (`image_toolkit_entrypoint.py`): the
-  krea2 evaluation weights the unconditioned branch 3:1 over the text-guided
-  branch, while caption-file training conditions on text ~95% of the time.
-  Captions are blanked at dataset prep so the training distribution matches the
-  scored distribution.
-
-Layout follows the trainer contract: `ops/docker/standalone-image-toolkit-trainer.dockerfile`
-builds the toolkit-era model types, `ops/docker/standalone-image-trainer.dockerfile`
-routes flux tasks through the same container and entrypoint, and
-`core/training_templates/` carries the per-architecture training configs.
-
-Complete single-file FLUX checkpoints use `flux_single_file.py` and a build-time
-patch to the pinned toolkit loader. Transformer, CLIP, T5 and VAE weights all
-come from the task checkpoint; incomplete standalone files fail explicitly.
-Only architecture configs/tokenizers are baked from the Diffusers team's pinned
-FLUX packaging, with its BNB quantization settings removed. Existing Diffusers
-folders keep their loading path. A three-step GPU delivery smoke passed, followed
-by adapter reload (494/494 modules) and a finite latent forward pass. T5's shared
-embedding binding is restored after loading; any remaining meta tensor fails
-explicitly. Full task quality and actual Docker execution remain unverified. A run with no
-nonempty, evaluator-pickable checkpoint now exits with an error.
-
-### `IMG_RECIPE` — training recipe and holdout experiment
-
-The toolkit Docker image sets `IMG_RECIPE=winner`; the validator does not inherit
-environment variables used by our external replay harness. An explicit
-`IMG_RECIPE=ours` selects the original flow above. `IMG_RECIPE=winner`
-switches **krea2** and **ideogram4** to the effective recipe of the 2026-09-07 image
-winner (hotkey 5EhyCWPu; reconstruction in `../rivals-config/winner-0907-{krea2,ideogram4}.yaml`).
-Other model types log a notice and run ours. Every winner-only step is fail-open: on any
-error the run prints `[recipe] WARN ...` and continues on ours (captions re-blanked,
-select+calibrate re-enabled).
-
-* krea2: captions kept verbatim with `caption_dropout_rate 0.20` (no blanking), steps 2000,
-  `optimal_noise_pairing_samples 4`, multires noise 6/0.3, `KREA2_MODLORA=1` (LoRA also on
-  `tproj` + `last.linear`), deadline-anneal (cosine to x0.05 over the last 30 % of the
-  forecast, ending at wall-120 s), tail-save densify (every 50 steps in the last 10 %,
-  target wall-300 s). Training stops at wall-120 s (`WINNER_WALL_MARGIN_S`), the latest
-  complete save is promoted, **no** select/calibrate pass. The winner's `KREA2_STEPS`,
-  `KREA2_NPAIR`, `KREA2_MRN`, `KREA2_MRN_DISC`, `KREA2_CAPDROP`, `KREA2_ANNEAL`,
-  `KREA2_ANNEAL_FRAC`, `KREA2_ANNEAL_FLOOR`, `KREA2_MODLORA` env knobs work as in its `krea.py`.
-* ideogram4: CONTENT school -- lr 4e-4 (`unet_lr` too), `min_denoising_steps 250`,
-  balanced/linear, EMA 0.995, TE frozen with cached embeddings, `cache_latents_to_disk`,
-  dropout 0.05, save every 100, tail-save densify, `do_cfg`/`cfg_scale`/`text_encoder_lr`
-  removed; steps = `max(120, min(1700, (remaining-420)/2.1, 25*n_images))` computed at
-  start; `unconditional_lora_path` kept only if the file is staged. The DETAIL (line-art)
-  school is not ported (the winner's category vote is logged for reference). The winner's
-  `IMG_LR`, `IMG_STEPS`, `IMG_EMA`, `IMG_MIN_DENOISE`, `IMG_MAX_DENOISE`,
-  `IMG_CONTENT_STYLE`, `IMG_TIMESTEP`, `IMG_TRAIN_TE`, `IMG_TE_LR`, `IMG_NETWORK_ALPHA`,
-  `IMG_CAPTION_DROPOUT` overrides apply as in its `ideogram.py`.
-* Patches: `ops/docker/patches/{multires_noise,mod_lora,deadline_anneal,tail_save_densify}.py`
-  (copied verbatim, origin header in each) are applied at build on the same ai-toolkit pin.
-  They are inert until a config key / env selects them, so `ours` is unaffected; a drifted
-  anchor only prints a warning at build and the entrypoint drops that mechanism's keys at
-  runtime (`[recipe] patch <name>: applied|MISSING`).
-* The startup log prints `[recipe] effective config diff vs our template` (every changed key).
-  Without a GPU: `python3 ops/docker/scripts/recipe_dryrun.py --n 45 --hours 1.0 [--print-yaml]`.
-
-`IMG_RECIPE=winner+holdout` is experimental and is not the image default. On
-ideogram4, it removes up to eight image/caption pairs from training, divides the
-training budget between two candidates, and scores their adapters on the withheld
-images. Candidate step counts use the retained training-set size and measured
-training speed. On krea2 it preserves the single-run winner recipe and captions;
-flux, qwen-image and z-image keep their existing templates. The selector is included
-in the toolkit image, and selection failure falls back to the first trained adapter.
-
-This holdout mechanism uses only the task's supplied training data. The current
-in-container scorer is a proxy: its CFG and sigma schedule differ from the validator.
-An earlier agreement measured using the validator scorer on both data splits does
-not establish agreement for this implementation. Release requires candidate-ranking
-validation and a new end-to-end run after the recipe-dispatch correction.
+`ops/docker/aitk-fallback.dockerfile` keeps the previous image trainer — the pinned ai-toolkit stack with
+`ops/docker/scripts/image_toolkit_entrypoint.py`, the krea2 prompt-prefix fix, krea2 tail-checkpoint selection,
+post-training LoRA strength calibration, the wall-clock guard and `IMG_RECIPE=winner`, which applies four build-time patches ported
+verbatim from the 2026-09-07 image winner (`ops/docker/patches/`, origin header in each) — so the lane can
+be switched back by copying it over the two image dockerfile names. None of it is part of the image built
+from this commit.
 
 ## Integrity
 
 All mechanisms in both lanes operate only on the job's own inputs and outputs. The training
-container is given a base model and a dataset by the validator and has no network
-egress; nothing in this repository fetches an external dataset, benchmark or
-evaluation data, or an external pretrained model or adapter, and nothing touches
-the evaluation pipeline. The calibration step is model selection over the adapter
-this job just trained, scored on the training images with the code in this repo.
-Output weights derive solely from the validator-provided base model and dataset.
+container is given a base model and a dataset by the validator and has no network egress;
+nothing in this repository fetches an external dataset, benchmark or evaluation data, or an
+external adapter, and nothing touches the evaluation pipeline. The only weights added to the
+image trainer's image are the evaluator's own VAE files (the ones
+`validator/evaluation/image_flow_adapter.py` loads), fetched at build time at fixed revisions and
+verified by SHA-256; they encode the task's own training images the way the evaluator encodes its
+test images. Checkpoint selection and the cross-fit soup score held-out images from the task's
+training set only. Output weights derive solely from the validator-provided base model and dataset.
