@@ -346,6 +346,7 @@ def _run_trial(
     warmup_steps: int = 0,
     eval_fn: Optional[Callable[[], float]] = None,
     out_step_losses: Optional[list] = None,
+    out_step_times: Optional[list] = None,
 ) -> tuple[float, Optional[str]]:
     """Train for `opt_steps` optimizer steps at `lr`, return (score, prune_reason).
 
@@ -443,6 +444,10 @@ def _run_trial(
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
             optimizer.step()
             optimizer.zero_grad()
+            if out_step_times is not None:
+                if use_amp:
+                    torch.cuda.synchronize()
+                out_step_times.append(time.perf_counter())
             step_loss = micro_loss_accum / micro_count
             micro_loss_accum = 0.0
             micro_count = 0
@@ -1103,3 +1108,87 @@ def run_lr_search(
         flush=True,
     )
     return best_lr, t_per_step
+
+
+# ── Timing without searching (SN56_LR_SEARCH=0) ──
+# The step-time measurement the search's warmup provided, without the search:
+# a few real optimizer steps on save/restored weights (discarded afterwards),
+# with the same OOM batch-halving ladder, timed at steady state (the first
+# steps pay allocator/kernel warm-up and would over-estimate step cost).
+_TIMING_STEPS = 12
+_TIMING_SKIP = 2
+
+
+def measure_step_time(
+    model,
+    train_dataloader,
+    lr: float,
+    grad_accum_steps: int = 1,
+    max_grad_norm: float = 1.0,
+    dataloader_factory=None,
+    optimizer_cls=None,
+    optimizer_kwargs: Optional[dict] = None,
+    n_steps: int = _TIMING_STEPS,
+    skip_steps: int = _TIMING_SKIP,
+) -> tuple[Optional[float], dict]:
+    """Return (seconds per optimizer step, info) — (None, info) when OOM
+    retries run out, exactly like the search's warmup gives up. info carries
+    the batch-token count of the timed steps (tokens_per_step) so the caller
+    can correct for unrepresentative batches, and the OOM halvings taken."""
+    if optimizer_cls is None:
+        from torch.optim import AdamW
+        optimizer_cls = AdamW
+    if optimizer_kwargs is None:
+        optimizer_kwargs = {"weight_decay": 0.0}
+    info: dict = {"oom_retries": 0, "tokens_per_step": None, "steps": n_steps}
+    state = _save_trainable_state(model)
+    batches = _materialize_batches(train_dataloader, n_steps * grad_accum_steps)
+    step_times: list = []
+    t0 = time.perf_counter()
+    while True:
+        try:
+            step_times.clear()
+            t0 = time.perf_counter()
+            _run_trial(model, batches, lr, n_steps, optimizer_cls, optimizer_kwargs,
+                       grad_accum_steps, max_grad_norm, out_step_times=step_times)
+            break
+        except RuntimeError as e:
+            if not _is_oom_error(e):
+                raise
+            _clear_memory()
+            info["oom_retries"] += 1
+            _restore_trainable_state(model, state)
+            if info["oom_retries"] > _MAX_OOM_RETRIES or dataloader_factory is None:
+                print(f"[sn56][cronometro] OOM após {info['oom_retries']} tentativas, sem medição", flush=True)
+                del state
+                _clear_memory()
+                return None, info
+            print(f"[sn56][cronometro] OOM, lote/2 (tentativa {info['oom_retries']}/{_MAX_OOM_RETRIES})", flush=True)
+            train_dataloader = dataloader_factory()
+            batches = _materialize_batches(train_dataloader, n_steps * grad_accum_steps)
+    _restore_trainable_state(model, state)
+    del state
+    try:
+        model.zero_grad(set_to_none=True)
+    except Exception:
+        pass
+    if len(step_times) > skip_steps + 1:
+        t_per_step = (step_times[-1] - step_times[skip_steps]) / (len(step_times) - 1 - skip_steps)
+    elif step_times:
+        t_per_step = (step_times[-1] - t0) / len(step_times)
+    else:
+        t_per_step = None
+    used = batches[: n_steps * grad_accum_steps]
+    n_tok = 0
+    for b in used:
+        ids = b.get("input_ids") if isinstance(b, dict) else None
+        if isinstance(ids, torch.Tensor):
+            n_tok += ids.numel()
+    if n_tok and used:
+        info["tokens_per_step"] = n_tok * grad_accum_steps / len(used)
+    _clear_memory()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"[sn56][cronometro] {len(step_times)} passos, t/passo={t_per_step}s "
+          f"(sem os {skip_steps} primeiros), OOM={info['oom_retries']}", flush=True)
+    return t_per_step, info

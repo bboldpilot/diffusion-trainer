@@ -199,6 +199,33 @@ def pack_data_points_FA(
     }
     
 
+def pack_data_points_padding_free(
+    data_points: List[Dict], tokenizer: Any, model_max_length: int
+) -> Dict:
+    """v5 lane packing (SN56_V5_PACK, see v5_pack.py): plain concatenation, no
+    padding and no attention mask. Isolation is carried by position_ids, which
+    restart at 0 for every example: transformers 5 turns them into FA2 varlen
+    cu_seqlens (or a block-diagonal mask on sdpa/eager), and the collator derives
+    seq_idx from them for short-conv layers. The first label of every example is
+    masked so no token is trained to predict across an example boundary."""
+    input_ids = []
+    label_ids = []
+    position_ids = []
+    for item in data_points:
+        seq_len = len(item["input_ids"])
+        input_ids += list(item["input_ids"])
+        labels = list(item["labels"])
+        labels[0] = -100
+        label_ids += labels
+        position_ids += list(range(seq_len))
+    assert len(input_ids) == len(label_ids) == len(position_ids)
+    return {
+        "input_ids": torch.tensor(input_ids),
+        "labels": torch.tensor(label_ids),
+        "position_ids": torch.tensor(position_ids),
+    }
+
+
 def pack_data_points_by_length(
     lengths: List[int], max_length: int, max_size: int = -1
 ) -> List[List[int]]:
@@ -314,11 +341,13 @@ class PackedDataset(Dataset):
         min_item_num: int = -1,
         seed: int = 42,
         use_fa: bool = True,
+        padding_free: bool = False,
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
         self.max_input_length = max_input_length
         self.use_fa = use_fa
+        self.padding_free = padding_free
 
         self.pack_length = pack_length
         if pack_length == -1:
@@ -359,6 +388,8 @@ class PackedDataset(Dataset):
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         group = self.groups[i]
         group_data_points = [self.data_points[index] for index in group]
+        if self.padding_free:
+            return pack_data_points_padding_free(group_data_points, self.tokenizer, self.max_input_length)
         pack_fn = pack_data_points_FA if self.use_fa else pack_data_points_naive
         return pack_fn(group_data_points, self.tokenizer, self.max_input_length)
 

@@ -12,9 +12,12 @@ the model_type is unknown to the main install. Every other task runs exactly as
 before.
 
 Behavioural differences inside the lane (see instruct_config.get_training_json):
-attention defaults to sdpa and sample packing is off — the Flash-Attention varlen
-monkeypatch is validated only on the 4.x path. Both are overridable through
-SN56_V5_ATTN / SN56_V5_PACKING for smoke tests.
+the 4.x Flash-Attention seq-id-mask packing monkeypatch is never used here. For
+InstructText full fine-tunes SN56_V5_PACK (v5_pack.py, default auto) picks
+flash_attention_2 + padding-free packing when a varlen probe passes on a
+packing-safe model type, else sdpa + length-grouped dynamic padding.
+SN56_V5_PACK=0 restores the original lane config: sdpa, packing off, batch capped
+(overridable through SN56_V5_ATTN / SN56_V5_PACKING / SN56_V5_MAX_BS).
 """
 
 import json

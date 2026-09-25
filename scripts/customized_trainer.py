@@ -74,6 +74,10 @@ class CustomEvalSaveCallback(TrainerCallback):
         self.end_time = end_time
         self.use_reward_accuracy = use_reward_accuracy
         self._eval_timing_adjusted = False
+        # SN56_EVAL_SKIP_FIX (train_instruct sets these after planning). None =
+        # the inherited rule below, which is what DPO/GRPO always use.
+        self.sn56_eval_skip_threshold = None
+        self.sn56_planned_steps = None
 
     def _patch_submission_architectures(self):
         """Restore original architectures in submission config.json after copy."""
@@ -215,6 +219,13 @@ class CustomEvalSaveCallback(TrainerCallback):
             control.should_evaluate = True
             control.should_save = True
             if when_to_eval["reason"] == "end_time":
+                if self.sn56_planned_steps:
+                    print(
+                        f"[sn56][plan] parada no passo {state.global_step} de "
+                        f"{self.sn56_planned_steps} planejados "
+                        f"({state.global_step / self.sn56_planned_steps:.0%})",
+                        flush=True,
+                    )
                 # Final wall-clock save: STOP training afterwards so
                 # trainer.train() returns (the dev-pass and success.txt live
                 # after it — epoch planning deliberately over-plans by 1.25x, so
@@ -233,7 +244,16 @@ class CustomEvalSaveCallback(TrainerCallback):
         # Only skip when training for >1 epoch; sub-epoch runs need every eval.
         # NEVER skip the end_time save: its trigger is one-shot (run_eval flag),
         # so cancelling it here would silently lose the final save entirely.
-        if control.should_evaluate and self.total_steps_all_epochs > 0:
+        if control.should_evaluate and self.sn56_eval_skip_threshold is not None:
+            # F1: threshold computed from the current steps/epoch and the planned
+            # total (sn56_plan.eval_skip_threshold); 0 = nothing skipped.
+            if (
+                when_to_eval["reason"] != "end_time"
+                and state.global_step < self.sn56_eval_skip_threshold
+            ):
+                control.should_evaluate = False
+                control.should_save = False
+        elif control.should_evaluate and self.total_steps_all_epochs > 0:
             steps_per_epoch = self.total_steps_all_epochs / max(1, args.num_train_epochs)
             if (
                 when_to_eval["reason"] != "end_time"

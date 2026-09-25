@@ -485,6 +485,9 @@ def main():
         args.task_type == TaskType.INSTRUCTTEXTTASK.value
         or args.task_type == TaskType.CHATTASK.value
     ):
+        # Instruct and Chat share train_instruct.py; the SN56_* fixes apply to
+        # InstructText only, so the request records which one this is.
+        train_info["task_type"] = args.task_type
         train_info = get_instruct_training_json(train_info)
         tokenize_cmd = (
             f"/workspace/axo_py/bin/python tokenize_instruct.py {request_path}"

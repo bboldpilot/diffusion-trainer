@@ -13,8 +13,9 @@ from dataclasses import dataclass, field
 from transformers import Trainer
 from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
 from checkpoint_avg_callback import AdaptiveTrainingCallback
-from lr_search import run_lr_search
+from lr_search import run_lr_search, measure_step_time
 from kl_trainer import KLRegularizedTrainer, load_base_model
+import sn56_plan
 
 # from packing.packed_dataset import PackedDataset
 from transformers import (
@@ -221,6 +222,23 @@ def main():
     if use_kl:
         log_info(f"[sn56][kl] USE_KL=1, kl_coef={kl_coef} — termo KL ativo")
 
+    # ── SN56_* fixes (flags + math in sn56_plan.py) ──
+    # InstructText full fine-tune only: ChatTask (same script), LoRA and
+    # DeepSpeed runs keep every inherited behaviour whatever the env says.
+    _task_type = train_request.get("task_type", "InstructTextTask")
+    _sn56_on = (
+        _task_type == "InstructTextTask"
+        and not training_args.use_lora
+        and getattr(training_args, "deepspeed", None) is None
+    )
+    _f_eval_fix = _sn56_on and sn56_plan.flag_on("SN56_EVAL_SKIP_FIX")
+    _f_time_plan = _sn56_on and sn56_plan.flag_on("SN56_TIME_PLAN")
+    _f_lr_search = (not _sn56_on) or sn56_plan.flag_on("SN56_LR_SEARCH")
+    _f_neftune = (not _sn56_on) or sn56_plan.flag_on("SN56_NEFTUNE")
+    _f_per_example = _sn56_on and sn56_plan.flag_on("SN56_PER_EXAMPLE_LOSS") and not use_kl
+    # F5: instruct_config decided the v5-lane mode (v5_pack.py); follow it.
+    _v5_mode = train_request.get("packing_mode") if train_request.get("packing_mode") in ("v5_fa2", "v5_dyn") else None
+
     from model_utility import load_tokenizer
     tokenizer = load_tokenizer(train_request["model_path"])
     if tokenizer.pad_token is None:
@@ -239,13 +257,18 @@ def main():
         max_length = train_request["max_length"]
 
     # we already tokenize the data and save it to .pt (torch format, fast)
-    train_ds = MyDataset(
+    _DatasetCls = MyDataset
+    if _v5_mode is not None:
+        # v5 modes pad per batch (V5Collator), never to max_length.
+        from v5_pack import NoPadDataset
+        _DatasetCls = NoPadDataset
+    train_ds = _DatasetCls(
         tokenizer,
         f"datasets/train_tokenized_{task_id}.json",
         max_length
     )
 
-    dev_ds = MyDataset(
+    dev_ds = _DatasetCls(
         tokenizer,
         f"datasets/dev_tokenized_{task_id}.json",
         max_length
@@ -310,9 +333,15 @@ def main():
     # can never fire on the packed (default) path.
     _raw_train_ds = train_ds
     _train_is_packed = False
+    # F5 v5_fa2: padding-free packing (position_ids carry the example
+    # boundaries); the 4.x seq-id-mask monkeypatch is NOT applied in the lane.
+    _pack_free = _v5_mode == "v5_fa2"
+    _pf_kw = {"padding_free": True} if _pack_free else {}
     if training_args.packing and not donot_pack:
         from monkeypatch import monkey_patch_packing_for_model, PackedDataset
-        if use_fa_packing:
+        if _pack_free:
+            log_info("[sn56][v5] costura sem preenchimento (position_ids), FA2 varlen")
+        elif use_fa_packing:
             log_info("costurando sequências com atenção rápida")
             monkey_patch_packing_for_model(train_request["model_path"])
         else:
@@ -326,6 +355,7 @@ def main():
             max_packed_size=training_args.max_packed_size,
             min_item_num=min_data_size_num,
             use_fa=use_fa_packing,
+            **_pf_kw,
         )
         _train_is_packed = True
         t2 = datetime.datetime.now()
@@ -333,7 +363,7 @@ def main():
         # Only pack eval with FA (proper sequence isolation).
         # Naive packing allows cross-attention between sequences which
         # corrupts eval loss — use unpacked eval for reliable checkpoint selection.
-        if use_fa_packing:
+        if use_fa_packing or _pack_free:
             t1 = datetime.datetime.now()
             dev_ds = PackedDataset(
                 dev_ds,
@@ -341,6 +371,7 @@ def main():
                 max_input_length=max_length,
                 max_packed_size=training_args.max_packed_size,
                 use_fa=True,
+                **_pf_kw,
             )
             t2 = datetime.datetime.now()
             log_info(f"costura teste: {(t2 - t1).total_seconds()}s")
@@ -402,6 +433,29 @@ def main():
     # some model need to set the generation config or encounter the invalid generation config error
     set_generation_config(train_request["model_name"], model)
 
+    # ── F5: v5-lane batches (see v5_pack.py) ──
+    _v5_collator = None
+    if _v5_mode is not None:
+        from v5_pack import V5Collator, patch_short_conv_seq_idx, SEQ_IDX_MODEL_TYPES, model_type_of
+        _v5_mt = model_type_of(train_request["model_path"])
+        _v5_seq_idx = _train_is_packed and _v5_mt in SEQ_IDX_MODEL_TYPES
+        _v5_patched = patch_short_conv_seq_idx() if _v5_seq_idx else []
+        _v5_collator = V5Collator(tokenizer.pad_token_id, pass_seq_idx=_v5_seq_idx)
+        if not _train_is_packed:
+            # Unpacked (v5_dyn, or too little data to pack): group similar
+            # lengths so per-batch padding stays small.
+            if hasattr(training_args, "train_sampling_strategy"):
+                training_args.train_sampling_strategy = "group_by_length"
+            else:
+                training_args.group_by_length = True
+        log_info(
+            f"[sn56][v5] attn={getattr(model.config, '_attn_implementation', '?')} "
+            f"packing={'padding-free' if _train_is_packed else 'off (dynamic padding, length-grouped)'} "
+            f"bs={training_args.per_device_train_batch_size} ga={training_args.gradient_accumulation_steps} "
+            f"max_length={max_length} mode={_v5_mode} model_type={_v5_mt} "
+            f"seq_idx={_v5_seq_idx} conv_patch={_v5_patched}"
+        )
+
     # Check if this is the main process and create the output directory
     if is_main_process(LOCAL_RANK):  # Only create directory on main process
         os.makedirs(training_args.output_dir, exist_ok=True)
@@ -462,14 +516,20 @@ def main():
     # Start with alpha=1 (barely noticeable) so the hook is active.
     # Rollback can escalate to 5 → 10 → 15 when overfitting is detected.
     # Higher initial alpha for noisy datasets where regularization is needed from step 1.
-    _neft_alpha = 1
-    if baseline_stats:
-        grad_noise = baseline_stats.get("training", {}).get("gradient_noise_scale", 0.0)
-        if grad_noise > 1.0:
-            _neft_alpha = 5
-            log_info(f"[sn56][neftune] grad_noise={grad_noise:.2f} > 1.0, alpha=5")
-    training_args.neftune_noise_alpha = _neft_alpha
-    log_info(f"[sn56][neftune] alpha={_neft_alpha}")
+    # SN56_NEFTUNE=0 (F4, default): no embedding noise — it is a regulariser for
+    # generation quality, while the score is held-out CE of the plain model.
+    if not _f_neftune:
+        training_args.neftune_noise_alpha = None
+        log_info("[sn56][neftune] desligado (SN56_NEFTUNE=0)")
+    else:
+        _neft_alpha = 1
+        if baseline_stats:
+            grad_noise = baseline_stats.get("training", {}).get("gradient_noise_scale", 0.0)
+            if grad_noise > 1.0:
+                _neft_alpha = 5
+                log_info(f"[sn56][neftune] grad_noise={grad_noise:.2f} > 1.0, alpha=5")
+        training_args.neftune_noise_alpha = _neft_alpha
+        log_info(f"[sn56][neftune] alpha={_neft_alpha}")
 
     # Averaging mode: in-RAM window averaging for non-sharded models that fit
     # host RAM; disk-based averaging of consolidated checkpoints for sharded
@@ -500,6 +560,12 @@ def main():
     # reference is wired in after the LR search to keep it out of OOM-sensitive
     # search memory. Non-KL tasks use the stock Trainer unchanged.
     _trainer_cls = KLRegularizedTrainer if use_kl else Trainer
+    if _f_per_example:
+        # F6 (SN56_PER_EXAMPLE_LOSS=1): mean over examples of per-token CE,
+        # the validator's test_loss weighting (sn56_loss.py).
+        from sn56_loss import make_per_example_trainer
+        _trainer_cls = make_per_example_trainer(_trainer_cls)
+        log_info("[sn56][perda] média por exemplo (SN56_PER_EXAMPLE_LOSS=1)")
     # Kept as a variable: the dev-pass budgeting below moves its end-time
     # trigger earlier once t_per_step is known (the trigger now also STOPS
     # training — see CustomEvalSaveCallback — which is what gives the dev-pass
@@ -511,6 +577,17 @@ def main():
         steps_per_epoch=total_steps_per_epoch,
         max_steps=max_steps,
     )
+    _eval_cb = CustomEvalSaveCallback(
+        when_to_eval_handler,
+        train_request["submission_dir"],
+        training_args.output_dir,
+        train_request["model_name"],
+        max_steps,
+        checking_step=checking_step,
+        total_steps_all_epochs=total_steps_all_epochs,
+        end_time=train_request["end_time"],
+        checking_mode=train_request.get("checking_mode", "none")
+    )
     _trainer_kwargs = dict(
         model=model,
         **trainer_tokenizer_kw(tokenizer),
@@ -519,19 +596,11 @@ def main():
         eval_dataset=dev_ds,
         callbacks=[
             *([] if ckpt_avg is None else [ckpt_avg]),
-            CustomEvalSaveCallback(
-                when_to_eval_handler,
-                train_request["submission_dir"],
-                training_args.output_dir,
-                train_request["model_name"],
-                max_steps,
-                checking_step=checking_step,
-                total_steps_all_epochs=total_steps_all_epochs,
-                end_time=train_request["end_time"],
-                checking_mode=train_request.get("checking_mode", "none")
-            )
+            _eval_cb,
         ],
     )
+    if _v5_collator is not None:
+        _trainer_kwargs["data_collator"] = _v5_collator
     if use_kl:
         _trainer_kwargs["kl_coef"] = kl_coef
         _trainer_kwargs["use_lora_base"] = bool(training_args.use_lora)
@@ -573,7 +642,97 @@ def main():
     _state_cache = get_state()
     _cached_lr = _state_cache.get("best_lr_found")
     _cached_bs = _state_cache.get("best_lr_batch_size")
-    if _cached_lr is not None:
+    _lr_note = "busca" if _f_lr_search else ""
+    if not _f_lr_search:
+        # ── F3 (SN56_LR_SEARCH=0): no search. The LR is the finder estimate
+        # already in the command (lr_finder via instruct_config, x reg_ratio)
+        # x SN56_LR_MULT, re-centred with the sqrt rule if the batch changed.
+        # A few timed steps still measure t_per_step (and walk the same OOM
+        # halving ladder) for the time plan; their weights are discarded.
+        if torch.cuda.is_available():
+            device = torch.device(f"cuda:{LOCAL_RANK}")
+            model = model.to(device)
+            log_info(f"[sn56][cronometro] Modelo movido pra {device}")
+
+        def _eff_bs_now():
+            return (training_args.per_device_train_batch_size
+                    * training_args.gradient_accumulation_steps
+                    * training_args.world_size)
+
+        # Reference = the first attempt's command LR and effective batch; OOM
+        # retries (text_trainer halves the batch in the command) re-centre on it.
+        _lr_ref = _state_cache.get("sn56_lr_ref")
+        if not _lr_ref:
+            _lr_ref = {"lr": float(training_args.learning_rate), "eff_bs": int(_eff_bs_now())}
+            _state_cache["sn56_lr_ref"] = _lr_ref
+            if is_main_process(LOCAL_RANK):
+                set_state(_state_cache)
+
+        def _halve_batch_timing_loader():
+            cur = training_args.per_device_train_batch_size
+            new_bs = max(1, cur // 2)
+            training_args.per_device_train_batch_size = new_bs
+            trainer._train_batch_size = training_args.train_batch_size
+            log_info(f"[sn56][cronometro] Cozinha quente, lote {cur} -> {new_bs}")
+            return trainer.get_train_dataloader()
+
+        original_bs = training_args.per_device_train_batch_size
+        t_per_step, _timing = measure_step_time(
+            model,
+            trainer.get_train_dataloader(),
+            lr=float(training_args.learning_rate),
+            grad_accum_steps=training_args.gradient_accumulation_steps,
+            max_grad_norm=training_args.max_grad_norm,
+            dataloader_factory=_halve_batch_timing_loader,
+        )
+        # Length-grouped (unpacked v5) batches are served longest-first, so the
+        # timed steps over-state the epoch-average step cost: scale by tokens.
+        if (
+            t_per_step is not None
+            and _v5_mode is not None
+            and not _train_is_packed
+            and _timing.get("tokens_per_step")
+        ):
+            _lens = [min(len(dp["input_ids"]), max_length) for dp in _raw_train_ds.eval_dataset] or [1]
+            _expected = (training_args.gradient_accumulation_steps
+                         * training_args.per_device_train_batch_size
+                         * (sum(_lens) / len(_lens)) * 1.05)
+            _corr = sn56_plan.tokens_correction(_timing["tokens_per_step"], _expected)
+            log_info(f"[sn56][cronometro] correção por tokens x{_corr:.2f} "
+                     f"({_timing['tokens_per_step']:.0f} medidos vs ~{_expected:.0f}/passo)")
+            t_per_step *= _corr
+
+        if torch.distributed.is_initialized():
+            _bs_t = torch.tensor(
+                [training_args.per_device_train_batch_size],
+                device=next(model.parameters()).device,
+            )
+            torch.distributed.all_reduce(_bs_t, op=torch.distributed.ReduceOp.MIN)
+            _min_bs = int(_bs_t.item())
+            if _min_bs < training_args.per_device_train_batch_size:
+                log_info(
+                    f"[sn56][cronometro] OOM em outro rank: lote "
+                    f"{training_args.per_device_train_batch_size} -> {_min_bs} (sincronizado)"
+                )
+                training_args.per_device_train_batch_size = _min_bs
+        if training_args.per_device_train_batch_size != original_bs:
+            trainer._train_batch_size = training_args.train_batch_size
+            log_info(f"[sn56][cronometro] Lote reduzido: {original_bs} -> "
+                     f"{training_args.per_device_train_batch_size} (carries to training)")
+        if torch.distributed.is_initialized():
+            _sync = torch.tensor([t_per_step or 0.0], device=next(model.parameters()).device)
+            torch.distributed.broadcast(_sync, src=0)
+            t_per_step = _sync[0].item() if _sync[0].item() > 0 else None
+            for p in model.parameters():
+                if p.requires_grad:
+                    torch.distributed.broadcast(p.data, src=0)
+
+        _lr_mult = sn56_plan.flag_float("SN56_LR_MULT")
+        best_lr = sn56_plan.lr_for_batch(_lr_ref["lr"], _lr_ref["eff_bs"], _eff_bs_now(), _lr_mult)
+        trainer.args.learning_rate = best_lr
+        _lr_note = f"finder x{_lr_mult:g} (lote efetivo {_lr_ref['eff_bs']}->{_eff_bs_now()})"
+        log_info(f"[sn56][cronometro] sem busca de LR: lr={best_lr:.2e} ({_lr_note})")
+    elif _cached_lr is not None:
         import math
         _current_bs = training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps * training_args.world_size
         if _cached_bs is not None and _cached_bs != _current_bs:
@@ -730,6 +889,7 @@ def main():
                     max_packed_size=training_args.max_packed_size,
                     min_item_num=min_data_size_num,
                     use_fa=use_fa_packing,
+                    **_pf_kw,
                 )
                 trainer.train_dataset = train_ds
                 _t2 = datetime.datetime.now()
@@ -743,9 +903,79 @@ def main():
                 f"steps/epoch agora {len(train_ds) // _cur_eff_bs})"
             )
 
+    # ── F2 (SN56_TIME_PLAN=1): optimizer steps from the time budget ──
+    # Plan the steps that fit until the FINAL-SAVE trigger (end_time minus the
+    # save + dev-pass reserve — where training really stops), net of the
+    # eval/save overhead the plan implies, so the cosine reaches its floor at
+    # the real cutoff. E = steps / steps-per-epoch with no floor, capped at
+    # SN56_MAX_EPOCHS; the overfit early stop (AdaptiveTrainingCallback) stays.
+    # Computed on rank 0 and broadcast, like the inherited planning below.
+    _plan = None
+    if t_per_step is not None and not _use_deepspeed and _f_time_plan:
+        _plan_t = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0], device=next(model.parameters()).device)
+        _cur_eff_bs_p = max(1, training_args.per_device_train_batch_size
+                            * training_args.gradient_accumulation_steps
+                            * training_args.world_size)
+        _spe_p = max(1, len(train_ds) // _cur_eff_bs_p)
+        if is_main_process(LOCAL_RANK):
+            _reserve_min = float(train_request["save_before_remaining_time"])
+            if is_final_run and _avg_mode == "ram" and len(dev_ds) > 0:
+                # Same dev-pass reserve the [devfit] block applies below.
+                _, _dp_extra = sn56_plan.devpass_reserve(
+                    len(dev_ds), training_args.world_size, t_per_step,
+                    training_args.gradient_accumulation_steps,
+                    training_args.per_device_train_batch_size)
+                _reserve_min += _dp_extra
+            _stop_ts = sn56_plan.parse_utc(train_request["end_time"]) - 60.0 * _reserve_min
+            _eval_cost = 0.0
+            if is_final_run and len(dev_ds) > 0:
+                _eval_cost = sn56_plan.estimate_eval_cost_s(
+                    int(len(dev_ds) / max(1, training_args.world_size)), t_per_step,
+                    training_args.gradient_accumulation_steps * training_args.per_device_train_batch_size,
+                    _param_nums)
+            _p = sn56_plan.plan_time_budget(
+                now_ts=datetime.datetime.now(datetime.timezone.utc).timestamp(),
+                stop_ts=_stop_ts,
+                t_per_step=t_per_step,
+                steps_per_epoch=_spe_p,
+                max_epochs=sn56_plan.max_epochs(),
+                warmup_cap=training_args.warmup_steps,
+                eval_cost_s=_eval_cost,
+                periodic_save_steps=periodic_save_steps,
+            )
+            _plan_t[0] = float(_p["planned_steps"])
+            _plan_t[1] = float(_p["epochs"])
+            _plan_t[2] = float(_p["warmup"])
+            _plan_t[3] = float(_p["eval_steps"])
+            _plan_t[4] = 1.0 if _p["capped"] else 0.0
+            log_info(
+                f"[sn56][relogio] plano por tempo: {_p['planned_steps']} passos "
+                f"(E={_p['epochs']:.2f}, teto {sn56_plan.max_epochs():g} épocas, capped={_p['capped']}), "
+                f"t_per_step={t_per_step:.3f}s, parada final {sn56_plan.fmt_utc(_stop_ts)} "
+                f"(T-{_reserve_min:.1f}min), evals~{_p['n_evals']} x {_eval_cost:.0f}s, "
+                f"warmup={_p['warmup']}, eval_steps={_p['eval_steps']}"
+            )
+        if torch.distributed.is_initialized():
+            torch.distributed.broadcast(_plan_t, src=0)
+        if _plan_t[0] > 0:
+            _plan = {
+                "planned_steps": int(_plan_t[0].item()),
+                "epochs": float(_plan_t[1].item()),
+                "warmup": int(_plan_t[2].item()),
+                "eval_steps": int(_plan_t[3].item()),
+                "capped": bool(_plan_t[4].item() > 0.5),
+                "steps_per_epoch": _spe_p,
+            }
+            training_args.max_steps = _plan["planned_steps"]
+            training_args.num_train_epochs = _plan["epochs"]
+            training_args.warmup_steps = _plan["warmup"]
+            if is_final_run:
+                training_args.eval_steps = _plan["eval_steps"]
+                training_args.save_steps = _plan["eval_steps"]
+
     # ── Time-aware epoch planning ──
     # Compute on rank 0, broadcast to all ranks to avoid NCCL deadlock.
-    if t_per_step is not None and not _use_deepspeed:
+    if t_per_step is not None and not _use_deepspeed and not _f_time_plan:
         _epoch_info = torch.tensor([0.0, 0.0, 0.0], device=next(model.parameters()).device)
 
         if is_main_process(LOCAL_RANK):
@@ -847,6 +1077,48 @@ def main():
         log_info(f"[sn56][kl] modelo base congelado carregado em {_kl_device} (full-FT)")
     elif use_kl:
         log_info("[sn56][kl] usando disable_adapter do LoRA como base (sem cópia)")
+
+    # ── F1 (SN56_EVAL_SKIP_FIX=1): eval-skip threshold from the CURRENT
+    # steps/epoch and the planned total (the inherited rule divides a total
+    # computed with E=3 by the re-planned E). ──
+    _eff_bs_f = max(1, training_args.per_device_train_batch_size
+                    * training_args.gradient_accumulation_steps
+                    * training_args.world_size)
+    _spe_f = max(1, len(train_ds) // _eff_bs_f)
+    _total_f = (int(training_args.max_steps) if training_args.max_steps and training_args.max_steps > 0
+                else int(_spe_f * training_args.num_train_epochs))
+    if _f_eval_fix:
+        _eval_cb.sn56_eval_skip_threshold = sn56_plan.eval_skip_threshold(
+            _spe_f, _total_f, training_args.num_train_epochs)
+        _eval_cb.total_steps_all_epochs = _total_f
+    if _sn56_on:
+        _eval_cb.sn56_planned_steps = _total_f
+        # One line with every flag and the resulting plan (visible with
+        # SN56_VERBOSE=1, like every other log line here).
+        _thr_f = (_eval_cb.sn56_eval_skip_threshold if _eval_cb.sn56_eval_skip_threshold is not None
+                  else sn56_plan.legacy_eval_skip_threshold(total_steps_all_epochs, training_args.num_train_epochs))
+        _es_f = int(training_args.eval_steps) if training_args.eval_steps else 0
+        _pts_f = sn56_plan.eval_points(_total_f, _es_f, _thr_f, _spe_f, periodic_save_steps) if _es_f else []
+        _save_ts_f = (sn56_plan.parse_utc(train_request["end_time"])
+                      - 60.0 * float(when_to_eval_handler.save_before_remaining_time))
+        log_info(
+            f"[sn56][plan] flags={sn56_plan.flags_summary()} "
+            f"lr={trainer.args.learning_rate:.3e} ({_lr_note or 'cache'}) "
+            f"t_step={(f'{t_per_step:.3f}s' if t_per_step else 'n/a')} "
+            f"mode={'time' if _plan else ('legacy' if t_per_step else 'none')} "
+            f"steps={_total_f} E={training_args.num_train_epochs:.2f} steps/epoch={_spe_f} "
+            f"cap={sn56_plan.max_epochs():g}ep capped={bool(_plan and _plan['capped'])} "
+            f"warmup={training_args.warmup_steps} eval_every={_es_f} eval_skip<{_thr_f} "
+            f"first_eval={_pts_f[0] if _pts_f else 'end'} evals~{len(_pts_f)} "
+            f"final_save={sn56_plan.fmt_utc(_save_ts_f)} "
+            f"(T-{float(when_to_eval_handler.save_before_remaining_time):.1f}min) "
+            f"bs={training_args.per_device_train_batch_size} ga={training_args.gradient_accumulation_steps} "
+            f"neftune={training_args.neftune_noise_alpha} per_example_loss={_f_per_example} "
+            f"v5={_v5_mode or '-'}"
+        )
+    else:
+        log_info(f"[sn56][plan] correções inativas (tarefa={_task_type}, lora={training_args.use_lora}, "
+                 f"deepspeed={_use_deepspeed}) — caminho herdado")
 
     log_info(f"fiscalização a cada {training_args.eval_steps} passos, {len(dev_ds)} na prova")
     trainer.train()

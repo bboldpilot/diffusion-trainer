@@ -11,6 +11,7 @@ from copy import deepcopy
 from lr_finder import estimate_starting_lr
 from adaptive_max_length import compute_max_length
 from v5_lane import is_v5_lane, launcher
+from sn56_plan import v5_pack_setting
 
 
 FIXED_BS_CONFIG = {
@@ -239,7 +240,35 @@ def get_training_json(train_info: dict) -> dict:
     # otherwise (SN56_V5_ATTN / SN56_V5_PACKING). Without packing every sample is
     # padded to max_length, so the per-device batch is capped (SN56_V5_MAX_BS) and
     # the effective batch is restored through gradient accumulation below.
-    if is_v5_lane():
+    # SN56_V5_PACK (F5, see v5_pack.py) replaces those defaults for InstructText
+    # tasks: auto -> flash_attention_2 + padding-free packing when a real varlen
+    # probe passes on a packing-safe model type, else sdpa + length-grouped
+    # dynamic padding; both keep the bucket batch size. 0 -> the block below.
+    _v5_pack = v5_pack_setting()
+    if (
+        is_v5_lane()
+        and _v5_pack != "0"
+        and train_info.get("task_type", "InstructTextTask") == "InstructTextTask"
+        and not run_config["use_lora"]
+        and run_config["distributed"] != "ds"
+    ):
+        from v5_pack import choose_v5_mode
+
+        _v5_mode, _v5_reason = choose_v5_mode(model_path, _v5_pack)
+        if _v5_mode == "v5_fa2":
+            run_config["use_attn_implementation"] = "flash_attention_2"
+            run_config["packing"] = "True"
+        else:
+            run_config["use_attn_implementation"] = "sdpa"
+            run_config["packing"] = "False"
+        run_config["packing_mode"] = _v5_mode
+        print(
+            f"[sn56][v5] mode={_v5_mode} attn={run_config['use_attn_implementation']} "
+            f"packing={run_config['packing']} bucket_bs={run_config['batch_size']} "
+            f"(SN56_V5_PACK={_v5_pack}: {_v5_reason})",
+            flush=True,
+        )
+    elif is_v5_lane():
         run_config["use_attn_implementation"] = os.environ.get("SN56_V5_ATTN", "sdpa")
         run_config["packing"] = os.environ.get("SN56_V5_PACKING", "False")
         if run_config["packing"] != "True":
