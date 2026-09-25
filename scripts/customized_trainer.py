@@ -7,6 +7,7 @@ from transformers import (
     TrainerControl,
 )
 import os
+import time
 from typing import Callable, Optional, Dict
 import shutil
 import json
@@ -78,6 +79,71 @@ class CustomEvalSaveCallback(TrainerCallback):
         # the inherited rule below, which is what DPO/GRPO always use.
         self.sn56_eval_skip_threshold = None
         self.sn56_planned_steps = None
+        # F2 tail plan (train_instruct, InstructText full-FT only): the planned
+        # write time and the WhenToEvalHandler whose final-save trigger moves
+        # earlier if the first real checkpoint write is slower than planned.
+        self.sn56_tail = None
+        # Build the submission next to the current one and swap, so a failed
+        # copy (ENOSPC, 25 Sep) leaves the previous submission loadable.
+        self.sn56_atomic_copy = False
+        self._save_t0 = None
+        self._save_measured = False
+
+    def _copy_to_submission(self, src_dir: str):
+        if not self.sn56_atomic_copy:
+            if os.path.exists(self.submission_dir):
+                shutil.rmtree(self.submission_dir)
+            shutil.copytree(src_dir, self.submission_dir)
+            return
+        base = self.submission_dir.rstrip("/")
+        staging, backup = base + ".ckpt_new", base + ".ckpt_old"
+        for d in (staging, backup):
+            if os.path.exists(d):
+                shutil.rmtree(d, ignore_errors=True)
+        try:
+            shutil.copytree(src_dir, staging)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        if os.path.exists(base):
+            os.rename(base, backup)
+        os.rename(staging, base)
+        shutil.rmtree(backup, ignore_errors=True)
+
+    def _sn56_measure_save(self):
+        """F2: time the first checkpoint write against the tail plan's
+        estimate (rank 0), broadcast it, and move the final-save trigger
+        earlier on every rank alike when the disk is slower than planned."""
+        tail = self.sn56_tail
+        if not tail or self._save_measured:
+            return
+        self._save_measured = True
+        write_s = 0.0
+        if self._save_t0 is not None and is_main_process(LOCAL_RANK):
+            write_s = time.perf_counter() - self._save_t0
+        if torch.distributed.is_initialized():
+            dev = torch.device(f"cuda:{LOCAL_RANK}") if torch.cuda.is_available() else torch.device("cpu")
+            t = torch.tensor([write_s], dtype=torch.float64, device=dev)
+            torch.distributed.broadcast(t, src=0)
+            write_s = float(t.item())
+        planned = float(tail.get("save_s") or 0.0)
+        handler = tail.get("handler")
+        if write_s <= 0.0 or planned <= 0.0 or handler is None:
+            return
+        extra = 0.0
+        if write_s > 1.5 * planned:
+            # every later write grows alike: the final checkpoint, its copy
+            # (read + write) and the saves after the soup / dev-pass.
+            extra = (write_s - planned) * (1.0 + float(tail.get("copy_factor", 2.0))
+                                           + float(tail.get("n_saves_after", 0)))
+            handler.save_before_remaining_time = float(handler.save_before_remaining_time) + extra / 60.0
+        if is_main_process(LOCAL_RANK):
+            print(
+                f"[sn56][tail] gravação medida {write_s:.1f}s (plano {planned:.0f}s)"
+                + (f"; parada final antecipada em {extra:.0f}s "
+                   f"(T-{float(handler.save_before_remaining_time):.1f}min)" if extra else ""),
+                flush=True,
+            )
 
     def _patch_submission_architectures(self):
         """Restore original architectures in submission config.json after copy."""
@@ -263,6 +329,8 @@ class CustomEvalSaveCallback(TrainerCallback):
                 control.should_evaluate = False
                 control.should_save = False
 
+        if control.should_save:
+            self._save_t0 = time.perf_counter()
         return control
 
 
@@ -270,6 +338,8 @@ class CustomEvalSaveCallback(TrainerCallback):
         self, args, state: TrainerState, control: TrainerControl, metrics, **kwargs
     ):
         self.save_only = False
+        # the checkpoint write starts after this callback: time it from here
+        self._save_t0 = time.perf_counter()
         # Append eval_loss to file
         eval_loss = self.compute_loss(state, metrics)
         if state.global_step < 2:
@@ -321,21 +391,16 @@ class CustomEvalSaveCallback(TrainerCallback):
             control.should_training_stop = True
 
         self.has_checkpoint = True
-        
+        # all ranks: the measurement broadcasts (a collective) when planned
+        self._sn56_measure_save()
+
         if not is_main_process(LOCAL_RANK): # if not main process, skip this
-            return 
-            
-        if self.save_only: # if only save, do not evaluate 
+            return
+
+        if self.save_only: # if only save, do not evaluate
             print(f"só salvando, sem avaliação, passo={state.global_step}", flush=True)
             current_step = state.global_step
-            # Remove existing directory if it exists
-            if os.path.exists(self.submission_dir):
-                shutil.rmtree(self.submission_dir)
-                
-            shutil.copytree(
-                os.path.join(self.output_dir, f"checkpoint-{current_step}"),
-                self.submission_dir
-            )
+            self._copy_to_submission(os.path.join(self.output_dir, f"checkpoint-{current_step}"))
             self._patch_submission_architectures()
             self.update_best_checkpoint = False
             # add a loss.txt file to the submission directory
@@ -353,13 +418,9 @@ class CustomEvalSaveCallback(TrainerCallback):
             and is_main_process(LOCAL_RANK)
         ):
             print(f"enviando melhor checkpoint, passo={state.global_step}", flush=True)
-            # Remove existing directory if it exists
-            if os.path.exists(self.submission_dir):
-                shutil.rmtree(self.submission_dir)
             best_eval_loss = self.best_checkpoint_info["loss"]
-            shutil.copytree(
-                os.path.join(self.output_dir, f"checkpoint-{self.best_checkpoint_info['step']}"),
-                self.submission_dir
+            self._copy_to_submission(
+                os.path.join(self.output_dir, f"checkpoint-{self.best_checkpoint_info['step']}")
             )
             self._patch_submission_architectures()
             self.update_best_checkpoint = False

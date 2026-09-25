@@ -26,6 +26,7 @@ from transformers import (
 import os
 import datetime
 import shutil
+import time
 from huggingface_hub import HfApi
 from typing import Callable, Optional
 import bitsandbytes as bnb
@@ -238,6 +239,41 @@ def main():
     _f_per_example = _sn56_on and sn56_plan.flag_on("SN56_PER_EXAMPLE_LOSS") and not use_kl
     # F5: instruct_config decided the v5-lane mode (v5_pack.py); follow it.
     _v5_mode = train_request.get("packing_mode") if train_request.get("packing_mode") in ("v5_fa2", "v5_dyn") else None
+
+    # ── Late-attempt guard (F2) ──
+    # text_trainer re-runs this script after any crash. A retry that cannot
+    # load the model, probe the step time, train a meaningful number of steps
+    # and write before end_time must not re-plan the last minutes (25 Sep,
+    # 3B/1.5h: six such attempts of 20 and 10 steps ran into the hard kill).
+    # With a valid submission from an earlier attempt on disk it keeps it,
+    # writes success.txt and exits. Rank 0 decides; the flag is broadcast so
+    # DDP ranks exit together.
+    if _sn56_on and train_request.get("end_time"):
+        _late = False
+        if is_main_process(LOCAL_RANK):
+            _remaining0 = (sn56_plan.parse_utc(train_request["end_time"])
+                           - datetime.datetime.now(datetime.timezone.utc).timestamp())
+            _last_plan = get_state().get("sn56_last_plan") or {}
+            _late = sn56_plan.late_attempt(
+                _remaining0, sn56_plan.submission_is_valid(train_request.get("submission_dir", "")),
+                _last_plan.get("t_per_step"), _last_plan.get("reserve_s"))
+            if _late:
+                log_info(
+                    f"[sn56][guard] tentativa tardia: {_remaining0:.0f}s até end_time, submissão "
+                    f"válida em {train_request.get('submission_dir')} — sem novo plano, submissão mantida"
+                )
+        if torch.distributed.is_initialized():
+            _late_t = torch.tensor([1.0 if _late else 0.0],
+                                   device=torch.device(f"cuda:{LOCAL_RANK}") if torch.cuda.is_available() else "cpu")
+            torch.distributed.broadcast(_late_t, src=0)
+            _late = bool(_late_t.item() > 0.5)
+        if _late:
+            if is_main_process(LOCAL_RANK):
+                os.makedirs(training_args.output_dir, exist_ok=True)
+                with open(os.path.join(training_args.output_dir, "success.txt"), "w") as f:
+                    f.write("Success")
+            log_info("missão cumprida (guard)", "finish")
+            return
 
     from model_utility import load_tokenizer
     tokenizer = load_tokenizer(train_request["model_path"])
@@ -549,6 +585,17 @@ def main():
         )
         if is_final_run else None
     )
+    if _sn56_on:
+        # Bound the checkpoints on disk. Every eval point writes a weights-only
+        # checkpoint; nothing pruned them, so a 3B run (6.2 GB each, every 20
+        # steps) filled the disk at its 17th and died in safetensors (25 Sep).
+        # The best checkpoint is copied into the submission dir the moment it
+        # is written, so only the current one is needed afterwards; disk-mode
+        # averaging reads the last `disk_members` from disk and keeps those.
+        training_args.save_total_limit = (
+            (ckpt_avg.disk_members if ckpt_avg is not None else 4) + 1 if _avg_mode == "disk" else 2
+        )
+        log_info(f"[sn56][disco] save_total_limit={training_args.save_total_limit}")
     if ckpt_avg is not None:
         ckpt_avg._submission_dir = train_request["submission_dir"]
         # end_time bounds the greedy soup's eval time at train end (it may use
@@ -588,6 +635,7 @@ def main():
         end_time=train_request["end_time"],
         checking_mode=train_request.get("checking_mode", "none")
     )
+    _eval_cb.sn56_atomic_copy = _sn56_on
     _trainer_kwargs = dict(
         model=model,
         **trainer_tokenizer_kw(tokenizer),
@@ -605,6 +653,23 @@ def main():
         _trainer_kwargs["kl_coef"] = kl_coef
         _trainer_kwargs["use_lora_base"] = bool(training_args.use_lora)
     trainer = _trainer_cls(**_trainer_kwargs)
+    if _f_per_example and getattr(trainer, "_f6_mode", None) == "logits":
+        # F6 fallback for a head the hidden-state path cannot drive: the loss
+        # materialises the full (B, T, V) logits, so cap the per-device batch
+        # to what fits (bf16 logits + the fp32 CE chunk) and keep the
+        # effective batch with more accumulation.
+        from sn56_loss import cap_batch_for_logits
+        _V = int(getattr(model.config, "vocab_size", 0) or 0)
+        _new_bs, _new_ga = cap_batch_for_logits(
+            training_args.per_device_train_batch_size, training_args.gradient_accumulation_steps,
+            max_length, _V)
+        if (_new_bs, _new_ga) != (training_args.per_device_train_batch_size,
+                                   training_args.gradient_accumulation_steps):
+            log_info(f"[sn56][perda] F6 sem caminho oculto: lote {training_args.per_device_train_batch_size}x"
+                     f"{training_args.gradient_accumulation_steps} -> {_new_bs}x{_new_ga} (logits {_V} x {max_length})")
+            training_args.per_device_train_batch_size = _new_bs
+            training_args.gradient_accumulation_steps = _new_ga
+            trainer._train_batch_size = training_args.train_batch_size
 
     if ckpt_avg is not None:
         ckpt_avg.trainer = trainer
@@ -643,6 +708,7 @@ def main():
     _cached_lr = _state_cache.get("best_lr_found")
     _cached_bs = _state_cache.get("best_lr_batch_size")
     _lr_note = "busca" if _f_lr_search else ""
+    _lr_search_s = None
     if not _f_lr_search:
         # ── F3 (SN56_LR_SEARCH=0): no search. The LR is the finder estimate
         # already in the command (lr_finder via instruct_config, x reg_ratio)
@@ -740,6 +806,7 @@ def main():
             _cached_lr = _cached_lr * _scale
             log_info(f"[sn56][farejando] LR cached ajustado pra bs {_cached_bs}->{_current_bs}: {_cached_lr:.2e}")
         training_args.learning_rate = _cached_lr
+        _lr_note = "cache (busca da tentativa anterior, mult já aplicado)"
         log_info(f"[sn56][farejando] Usando LR cached de tentativa anterior: {_cached_lr:.2e}")
     elif _use_deepspeed:
         log_info(f"[sn56][farejando] Pulando (DeepSpeed ativo)")
@@ -760,6 +827,7 @@ def main():
             return trainer.get_train_dataloader()
 
         original_bs = training_args.per_device_train_batch_size
+        _t_search0 = time.perf_counter()
         best_lr, t_per_step = run_lr_search(
             model=model,
             train_dataloader=search_loader,
@@ -770,6 +838,7 @@ def main():
             dataloader_factory=_halve_batch_dataloader,
             steps_per_epoch=_steps_per_epoch,
         )
+        _lr_search_s = time.perf_counter() - _t_search0
 
         # Sync batch size across ranks: if ANY rank halved its batch on OOM
         # during the search, every rank must adopt the smallest surviving batch.
@@ -808,8 +877,16 @@ def main():
                     torch.distributed.broadcast(p.data, src=0)
             log_info(f"[sn56][farejando] Sincronizando lr={best_lr:.2e} + weights to all ranks")
 
+        # F3: SN56_LR_MULT scales the searched LR too (InstructText full-FT);
+        # the cached value below already carries it, so a retry never
+        # multiplies twice.
+        _lr_searched = best_lr
+        _lr_mult = sn56_plan.flag_float("SN56_LR_MULT") if _sn56_on else 1.0
+        if _lr_mult > 0 and _lr_mult != 1.0:
+            best_lr = best_lr * _lr_mult
         trainer.args.learning_rate = best_lr
-        log_info(f"[sn56][farejando] Usando lr={best_lr:.2e}")
+        _lr_note = f"busca {_lr_search_s:.0f}s: {_lr_searched:.3e} x{_lr_mult:g}"
+        log_info(f"[sn56][farejando] Usando lr={best_lr:.2e} ({_lr_note})")
         # Cache LR + batch size so OOM retries don't repeat the search
         _s = get_state()
         _s["best_lr_found"] = best_lr
@@ -911,28 +988,42 @@ def main():
     # SN56_MAX_EPOCHS; the overfit early stop (AdaptiveTrainingCallback) stays.
     # Computed on rank 0 and broadcast, like the inherited planning below.
     _plan = None
+    _tail = None          # the tail plan every rank applies (broadcast from rank 0)
     if t_per_step is not None and not _use_deepspeed and _f_time_plan:
-        _plan_t = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0], device=next(model.parameters()).device)
+        _plan_t = torch.zeros(14, dtype=torch.float64, device=next(model.parameters()).device)
         _cur_eff_bs_p = max(1, training_args.per_device_train_batch_size
                             * training_args.gradient_accumulation_steps
                             * training_args.world_size)
         _spe_p = max(1, len(train_ds) // _cur_eff_bs_p)
+        _want_soup = is_final_run and _avg_mode == "ram" and ckpt_avg is not None
+        _want_devpass = is_final_run and _avg_mode == "ram"
         if is_main_process(LOCAL_RANK):
-            _reserve_min = float(train_request["save_before_remaining_time"])
-            if is_final_run and _avg_mode == "ram" and len(dev_ds) > 0:
-                # Same dev-pass reserve the [devfit] block applies below.
-                _, _dp_extra = sn56_plan.devpass_reserve(
-                    len(dev_ds), training_args.world_size, t_per_step,
-                    training_args.gradient_accumulation_steps,
-                    training_args.per_device_train_batch_size)
-                _reserve_min += _dp_extra
-            _stop_ts = sn56_plan.parse_utc(train_request["end_time"]) - 60.0 * _reserve_min
-            _eval_cost = 0.0
-            if is_final_run and len(dev_ds) > 0:
-                _eval_cost = sn56_plan.estimate_eval_cost_s(
-                    int(len(dev_ds) / max(1, training_args.world_size)), t_per_step,
-                    training_args.gradient_accumulation_steps * training_args.per_device_train_batch_size,
-                    _param_nums)
+            # ── The tail (sn56_plan.tail_plan): everything that runs after the
+            # final-save trigger, priced from the model size, the measured step
+            # time, a measured write rate of the checkpoint disk and the dev
+            # size, with a safety margin. The trigger goes that far before
+            # end_time; the soup and the dev-pass get their own deadlines.
+            _end_ts = sn56_plan.parse_utc(train_request["end_time"])
+            _write_bps = sn56_plan.measure_write_bps(training_args.output_dir)
+            _tp = sn56_plan.tail_plan(
+                now_ts=datetime.datetime.now(datetime.timezone.utc).timestamp(),
+                end_ts=_end_ts,
+                t_per_step=t_per_step,
+                n_params=_param_nums,
+                n_dev_rows=len(dev_ds) if is_final_run else 0,
+                world_size=training_args.world_size,
+                grad_accum=training_args.gradient_accumulation_steps,
+                per_device_bs=training_args.per_device_train_batch_size,
+                write_bps=_write_bps,
+                soup_pool=(ckpt_avg.soup_max if ckpt_avg is not None else 0),
+                want_soup=_want_soup,
+                want_devpass=_want_devpass,
+            )
+            _stop_ts = _tp["trigger_ts"]
+            # a periodic eval point: the eval, the checkpoint write and (often)
+            # the copy of a new best into the submission dir
+            _eval_cost = (_tp["eval_s"] + _tp["save_s"] + 0.5 * _tp["copy_s"]
+                          if is_final_run and len(dev_ds) > 0 else 0.0)
             _p = sn56_plan.plan_time_budget(
                 now_ts=datetime.datetime.now(datetime.timezone.utc).timestamp(),
                 stop_ts=_stop_ts,
@@ -948,12 +1039,30 @@ def main():
             _plan_t[2] = float(_p["warmup"])
             _plan_t[3] = float(_p["eval_steps"])
             _plan_t[4] = 1.0 if _p["capped"] else 0.0
+            _plan_t[5] = float(_tp["reserve_s"])
+            _plan_t[6] = float(_tp["n_soup"])
+            _plan_t[7] = 1.0 if _tp["devpass"] else 0.0
+            _plan_t[8] = float(_tp["soup_deadline_ts"] - _tp["persist_s"])   # soup evals done by
+            _plan_t[9] = float(_tp["devpass_s"])
+            _plan_t[10] = float(_tp["save_s"])
+            _plan_t[11] = float(_tp["safety_s"])
+            _plan_t[12] = float(_tp["copy_s"])
+            _plan_t[13] = float(_tp["persist_s"])
             log_info(
                 f"[sn56][relogio] plano por tempo: {_p['planned_steps']} passos "
                 f"(E={_p['epochs']:.2f}, teto {sn56_plan.max_epochs():g} épocas, capped={_p['capped']}), "
                 f"t_per_step={t_per_step:.3f}s, parada final {sn56_plan.fmt_utc(_stop_ts)} "
-                f"(T-{_reserve_min:.1f}min), evals~{_p['n_evals']} x {_eval_cost:.0f}s, "
+                f"(T-{_tp['reserve_s'] / 60:.1f}min), evals~{_p['n_evals']} x {_eval_cost:.0f}s, "
                 f"warmup={_p['warmup']}, eval_steps={_p['eval_steps']}"
+            )
+            log_info(
+                f"[sn56][tail] reserva {_tp['reserve_s']:.0f}s = passo {_tp['step_s']:.1f}s + eval "
+                f"{_tp['eval_s']:.0f}s + gravação {_tp['save_s']:.0f}s + cópia {_tp['copy_s']:.0f}s + "
+                f"soup {_tp['n_soup']}x ({_tp['soup_s']:.0f}s) + persist {_tp['persist_s']:.0f}s + "
+                f"dev-pass {'%.0fs' % _tp['devpass_s'] if _tp['devpass'] else 'não'} + margem "
+                f"{_tp['safety_s']:.0f}s; disco {_write_bps / 1e9:.2f}GB/s, modelo "
+                f"{2 * _param_nums / 1e9:.1f}GB, última gravação até {sn56_plan.fmt_utc(_tp['final_write_ts'])} "
+                f"(end_time {sn56_plan.fmt_utc(_end_ts)}){' [cauda encolhida]' if _tp['shrunk'] else ''}"
             )
         if torch.distributed.is_initialized():
             torch.distributed.broadcast(_plan_t, src=0)
@@ -966,12 +1075,41 @@ def main():
                 "capped": bool(_plan_t[4].item() > 0.5),
                 "steps_per_epoch": _spe_p,
             }
+            _tail = {
+                "reserve_s": float(_plan_t[5].item()),
+                "n_soup": int(_plan_t[6].item()),
+                "devpass": bool(_plan_t[7].item() > 0.5),
+                "soup_eval_deadline_ts": float(_plan_t[8].item()),
+                "devpass_s": float(_plan_t[9].item()),
+                "save_s": float(_plan_t[10].item()),
+                "safety_s": float(_plan_t[11].item()),
+                "copy_s": float(_plan_t[12].item()),
+                "persist_s": float(_plan_t[13].item()),
+            }
             training_args.max_steps = _plan["planned_steps"]
             training_args.num_train_epochs = _plan["epochs"]
             training_args.warmup_steps = _plan["warmup"]
             if is_final_run:
                 training_args.eval_steps = _plan["eval_steps"]
                 training_args.save_steps = _plan["eval_steps"]
+            # The final-save trigger: end_time minus the whole tail.
+            when_to_eval_handler.save_before_remaining_time = _tail["reserve_s"] / 60.0
+            if ckpt_avg is not None:
+                ckpt_avg.soup_max = max(1, _tail["n_soup"])
+                ckpt_avg.soup_deadline_ts = _tail["soup_eval_deadline_ts"]
+            # First real checkpoint write is timed against save_s; a slower
+            # disk moves the trigger earlier on every rank (customized_trainer).
+            _eval_cb.sn56_tail = {
+                "save_s": _tail["save_s"],
+                "copy_factor": _tail["copy_s"] / max(1e-6, _tail["save_s"]),
+                "n_saves_after": (1 if _tail["persist_s"] > 0 else 0) + (1 if _tail["devpass"] else 0),
+                "handler": when_to_eval_handler,
+            }
+            if is_main_process(LOCAL_RANK):
+                # for the late-attempt guard of a retry
+                _s = get_state()
+                _s["sn56_last_plan"] = {"t_per_step": float(t_per_step), "reserve_s": _tail["reserve_s"]}
+                set_state(_s)
 
     # ── Time-aware epoch planning ──
     # Compute on rank 0, broadcast to all ranks to avoid NCCL deadlock.
@@ -1046,7 +1184,15 @@ def main():
     # fires in lockstep. Trades minutes of cosine-tail training (~min_lr, worth
     # little) for a full pass over held-out data.
     _dev_pass_secs = None
-    if is_final_run and _avg_mode == "ram" and len(dev_ds) > 0 and t_per_step is not None:
+    _dev_pass_allowed = True
+    _dev_safety_s = 0.0
+    if _tail is not None:
+        # F2 tail plan: the dev-pass budget and its deadline come from the plan
+        # (it may have dropped the dev-pass when the tail would eat too much).
+        _dev_pass_allowed = _tail["devpass"]
+        _dev_pass_secs = _tail["devpass_s"] if _tail["devpass"] else None
+        _dev_safety_s = _tail["safety_s"]
+    elif is_final_run and _avg_mode == "ram" and len(dev_ds) > 0 and t_per_step is not None:
         _micro_cost = t_per_step / max(
             1,
             training_args.gradient_accumulation_steps
@@ -1112,8 +1258,14 @@ def main():
             f"first_eval={_pts_f[0] if _pts_f else 'end'} evals~{len(_pts_f)} "
             f"final_save={sn56_plan.fmt_utc(_save_ts_f)} "
             f"(T-{float(when_to_eval_handler.save_before_remaining_time):.1f}min) "
+            f"tail={'%.0fs' % _tail['reserve_s'] if _tail else 'legacy'} "
+            f"soup={_tail['n_soup'] if _tail else '-'} devpass={_tail['devpass'] if _tail else '-'} "
+            f"lr_search={'on' if _f_lr_search else 'off'} "
+            f"lr_search_s={'%.0f' % _lr_search_s if _lr_search_s is not None else '-'} "
+            f"lr_mult={sn56_plan.flag_float('SN56_LR_MULT'):g} "
             f"bs={training_args.per_device_train_batch_size} ga={training_args.gradient_accumulation_steps} "
-            f"neftune={training_args.neftune_noise_alpha} per_example_loss={_f_per_example} "
+            f"neftune={training_args.neftune_noise_alpha} per_example_loss={_f_per_example}"
+            f"{'/' + getattr(trainer, '_f6_mode', '') if _f_per_example else ''} "
             f"v5={_v5_mode or '-'}"
         )
     else:
@@ -1121,7 +1273,31 @@ def main():
                  f"deepspeed={_use_deepspeed}) — caminho herdado")
 
     log_info(f"fiscalização a cada {training_args.eval_steps} passos, {len(dev_ds)} na prova")
-    trainer.train()
+    try:
+        trainer.train()
+    except Exception as _train_err:
+        # ── Crash guard (F2) ──
+        # A crash inside the loop (25 Sep: ENOSPC in a periodic checkpoint
+        # write) used to escape to text_trainer, which re-ran the whole script
+        # and re-planned the minutes left. Once this loop has written a valid
+        # submission there is nothing a re-plan can add: keep it, report
+        # success, exit. OOM keeps its inherited path (batch halving in
+        # text_trainer); a crash before any submission exists is retried as
+        # before.
+        _is_oom = isinstance(_train_err, getattr(torch, "OutOfMemoryError", ()) or ()) or \
+            "out of memory" in str(_train_err).lower()
+        if _sn56_on and not _is_oom and sn56_plan.submission_is_valid(train_request["submission_dir"]):
+            log_info(
+                f"[sn56][guard] treino interrompido no passo {trainer.state.global_step} "
+                f"({type(_train_err).__name__}: {str(_train_err)[:160]}); submissão válida em "
+                f"{train_request['submission_dir']} mantida, sem nova tentativa"
+            )
+            if is_main_process(LOCAL_RANK):
+                with open(os.path.join(training_args.output_dir, "success.txt"), "w") as f:
+                    f.write("Success")
+            log_info("missão cumprida (guard)", "finish")
+            return
+        raise
 
     # ── Final dev-data pass (data maximization on small datasets) ──
     # The dev split was held out only for selection; the scored test set is
@@ -1137,16 +1313,20 @@ def main():
         # stopped via overfit early-stop near the deadline, or the budgeting
         # above never ran on a cached-LR/DeepSpeed path).
         _dev_window_ok = True
-        if _dev_pass_secs is not None:
+        if not _dev_pass_allowed:
+            _dev_window_ok = False
+            log_info("[sn56][devfit] sem orçamento no plano da cauda, pulando")
+        elif _dev_pass_secs is not None:
             _end_dt = datetime.datetime.strptime(
                 train_request["end_time"], "%Y-%m-%d %H:%M:%S"
             ).replace(tzinfo=datetime.timezone.utc)
             _remaining = (_end_dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
-            _dev_window_ok = _remaining > _dev_pass_secs
+            # must finish AND leave the safety margin before end_time
+            _dev_window_ok = _remaining > _dev_pass_secs + _dev_safety_s
             if not _dev_window_ok:
                 log_info(
                     f"[sn56][devfit] sem janela ({_remaining:.0f}s restantes < "
-                    f"~{_dev_pass_secs:.0f}s necessários), pulando"
+                    f"~{_dev_pass_secs:.0f}s necessários + {_dev_safety_s:.0f}s de margem), pulando"
                 )
         if is_final_run and _avg_mode == "ram" and _dev_n > 0 and _dev_window_ok:
             from dev_pass import run_dev_pass

@@ -94,6 +94,11 @@ class AdaptiveTrainingCallback(TrainerCallback):
         # final soup into, and the task end_time that bounds the soup's evals.
         self._submission_dir: str | None = None
         self.end_time: str = ""
+        # F2 tail plan (train_instruct): wall-clock (epoch seconds) by which the
+        # soup's evals must be finished — the plan reserved the soup's time
+        # explicitly (n_soup x (merge + eval)) and the dev-pass + final save
+        # come after it. None = the inherited rule (half of what is left).
+        self.soup_deadline_ts: Optional[float] = None
 
         # Overfitting detection state
         self.overfit_counter = 0
@@ -284,16 +289,33 @@ class AdaptiveTrainingCallback(TrainerCallback):
         if seed_loss != seed_loss or seed_loss == float("inf"):
             return False
         per_eval = max(1.0, time.perf_counter() - t0)
-        remaining = self._soup_remaining_secs()
-        budget = (remaining * 0.5) if remaining is not None else float("inf")
+        # Deadline for the soup's evals: the planned one (F2 tail plan) when
+        # set, else the inherited half-of-what-is-left rule.
+        if self.soup_deadline_ts is not None:
+            deadline = float(self.soup_deadline_ts)
+        else:
+            remaining = self._soup_remaining_secs()
+            deadline = (time.time() + remaining * 0.5) if remaining is not None else float("inf")
+        if is_main:
+            print(
+                f"[sn56][soup] {k} cand(s), eval~{per_eval:.0f}s, prazo em "
+                f"{max(0.0, deadline - time.time()):.0f}s "
+                f"({'plano' if self.soup_deadline_ts is not None else 'metade do restante'})",
+                flush=True,
+            )
 
         best, n = seed_loss, 1
+        merge_s = 0.0
         for i in range(1, k):
-            # Stop if the next eval would blow the soup's time budget.
-            if (time.perf_counter() - t0) + per_eval > budget:
+            # Stop if the next merge + eval would pass the deadline. Rank 0
+            # decides and broadcasts so every rank breaks on the same
+            # candidate (the collectives below must stay in lockstep).
+            stop = time.time() + merge_s + per_eval > deadline if is_main else False
+            if self._bcast_flag(model, stop):
                 if is_main:
                     print(f"[sn56][soup] tempo esgotado após {i} cand(s)", flush=True)
                 break
+            t_merge = time.perf_counter()
             if is_main:   # tentative average → model params
                 inv = 1.0 / (n + 1)
                 st = cands[i]["state"]
@@ -301,6 +323,7 @@ class AdaptiveTrainingCallback(TrainerCallback):
                     if name in soup_sum and name in st:
                         p.data.copy_(((soup_sum[name] + st[name].float()) * inv).to(p.dtype))
             self._bcast_params(model)
+            merge_s = max(merge_s, time.perf_counter() - t_merge)
             cand_loss = self._eval_synced(model)
             accept = cand_loss == cand_loss and cand_loss < best - 1e-6
             if accept:

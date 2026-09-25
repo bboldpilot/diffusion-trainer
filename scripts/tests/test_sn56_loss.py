@@ -11,9 +11,76 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from sn56_loss import example_ids, per_example_ce  # noqa: E402
+from sn56_loss import (  # noqa: E402
+    cap_batch_for_logits,
+    example_ids,
+    is_oom,
+    linear_ce_chunked,
+    per_example_ce,
+    per_example_ce_from_hidden,
+)
 
 V = 11
+
+
+def test_hidden_path_equals_logits_path_with_grads():
+    # The chunked, checkpointed head + CE over response rows must equal the
+    # loss from materialised logits, in value and in gradient (weight + hidden).
+    torch.manual_seed(3)
+    B, T, D = 2, 9, 6
+    hidden = torch.randn(B, T, D, dtype=torch.float64, requires_grad=True)
+    weight = torch.randn(V, D, dtype=torch.float64, requires_grad=True)
+    bias = torch.randn(V, dtype=torch.float64, requires_grad=True)
+    labels = torch.randint(0, V, (B, T))
+    labels[0, :3] = -100
+    labels[1, :5] = -100
+    labels[1, 7:] = -100
+    ref_logits = torch.nn.functional.linear(hidden, weight, bias)
+    ref_total, ref_n = per_example_ce(ref_logits, labels)
+    ref_total.backward()
+    ref_grads = [t.grad.clone() for t in (hidden, weight, bias)]
+    for t in (hidden, weight, bias):
+        t.grad = None
+    total, n = per_example_ce_from_hidden(hidden, weight, bias, labels, chunk_rows=3)
+    assert n == ref_n == 2 and torch.allclose(total, ref_total, atol=1e-9), (total, ref_total)
+    total.backward()
+    for t, g in zip((hidden, weight, bias), ref_grads):
+        assert torch.allclose(t.grad, g, atol=1e-9)
+    # softcap is applied like the model would (Gemma-style tanh cap)
+    capped = torch.tanh(ref_logits.detach() / 5.0) * 5.0
+    c_total, _ = per_example_ce(capped, labels)
+    h_total, _ = per_example_ce_from_hidden(hidden.detach(), weight.detach(), bias.detach(), labels,
+                                            chunk_rows=4, softcap=5.0)
+    assert torch.allclose(c_total, h_total, atol=1e-9)
+    # the chunked per-token CE itself, without grad, in odd chunk sizes
+    rows = hidden.detach().reshape(-1, D)
+    tg = torch.randint(0, V, (rows.shape[0],))
+    a = linear_ce_chunked(rows, weight.detach(), bias.detach(), tg, chunk_rows=5)
+    b = torch.nn.functional.cross_entropy(torch.nn.functional.linear(rows, weight.detach(), bias.detach()), tg,
+                                          reduction="none")
+    assert torch.allclose(a, b.float(), atol=1e-6)
+    print("[ok] hidden path == logits path (value, grads, softcap, chunking)")
+
+
+def test_cap_batch_for_logits():
+    # P-G: Qwen2 vocab 151936, max_length 2048, bs 140: the full logits are
+    # 87 GB bf16; the cap keeps the effective batch with more accumulation.
+    bs, ga = cap_batch_for_logits(140, 1, 2048, 151936)
+    assert bs * 2 * 2048 * 151936 + 4 * 2048 * 151936 <= 6 * 1024 ** 3 and bs < 140, (bs, ga)
+    assert bs * ga >= 140 and (bs + 1) * 2 * 2048 * 151936 + 4 * 2048 * 151936 > 6 * 1024 ** 3
+    assert cap_batch_for_logits(8, 4, 2048, 32000) == (8, 4)          # fits: unchanged
+    assert cap_batch_for_logits(1, 1, 8192, 151936) == (1, 1)         # never below 1
+    assert cap_batch_for_logits(64, 1, 0, 151936) == (64, 1)          # unknown length: unchanged
+    print(f"[ok] logits-mode batch cap: 140x1 -> {bs}x{ga} on Qwen2/2048")
+
+
+def test_is_oom():
+    assert is_oom(RuntimeError("CUDA out of memory. Tried to allocate 65.93 GiB"))
+    oom_t = getattr(torch, "OutOfMemoryError", None)
+    if oom_t is not None:
+        assert is_oom(oom_t("CUDA out of memory"))
+    assert not is_oom(OSError(28, "No space left on device"))
+    print("[ok] OOM detection")
 
 
 def _example_mean(logits_1d, labels_1d):
@@ -118,19 +185,67 @@ def test_trainer_compute_loss():
         cls = make_per_example_trainer(Trainer)
         trainer = cls(model=model, args=args)
         assert trainer.model_accepts_loss_kwargs is False
+        assert trainer._f6_mode == "hidden", trainer._f6_mode   # Llama: decoder + lm_head + logits_to_keep
         batch = {
             "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 0, 0], [7, 8, 9, 1, 2, 3, 4, 5]]),
             "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1, 1, 1]]),
             "labels": torch.tensor([[-100, -100, 3, 4, 5, 6, -100, -100], [-100, -100, -100, -100, -100, -100, 4, 5]]),
         }
         loss, out = trainer.compute_loss(model, dict(batch), return_outputs=True)
-        total, n = per_example_ce(out.logits, batch["labels"], attention_mask=batch["attention_mask"])
-        assert n == 2 and torch.allclose(loss, total / 2)
+        assert trainer._f6_mode == "hidden" and trainer._f6_checked
+        assert out.logits.shape[1] == 1, out.logits.shape          # logits_to_keep=1: no (B, T, V)
+        full = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).logits
+        total, n = per_example_ce(full, batch["labels"], attention_mask=batch["attention_mask"])
+        assert n == 2 and torch.allclose(loss, total / 2, atol=1e-6), (loss, total / 2)
         stock = model(**batch).loss
         assert not torch.allclose(loss, stock)            # stock = token mean, 6 vs 2 tokens
         loss.backward()
         assert all(p.grad is not None for p in model.parameters())
-    print(f"[ok] PerExampleLoss{Trainer.__name__}.compute_loss (transformers {transformers.__version__})")
+        # gradients through the hidden path equal those of the materialised path
+        g_hidden = [p.grad.clone() for p in model.parameters()]
+        model.zero_grad(set_to_none=True)
+        full = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).logits
+        total, n = per_example_ce(full, batch["labels"], attention_mask=batch["attention_mask"])
+        (total / n).backward()
+        for p, g in zip(model.parameters(), g_hidden):
+            assert torch.allclose(p.grad, g, atol=1e-5), (p.grad - g).abs().max()
+        model.zero_grad(set_to_none=True)
+        # eval-style call (no grad): same value, no graph needed
+        with torch.no_grad():
+            loss_eval = trainer.compute_loss(model, dict(batch))
+        assert torch.allclose(loss_eval, loss.detach(), atol=1e-6)
+
+        # ── fail safe: an OOM inside F6 turns F6 off, the stock loss answers,
+        # the LR is untouched and nothing escapes to the retry ladder ──
+        lr_before = trainer.args.learning_rate
+        oom_t = getattr(torch, "OutOfMemoryError", RuntimeError)
+
+        def _boom(*a, **k):
+            raise oom_t("CUDA out of memory. Tried to allocate 65.93 GiB")
+
+        trainer._f6_loss = _boom
+        loss2 = trainer.compute_loss(model, dict(batch))
+        assert trainer._f6_mode == "off" and trainer._f6_hook is None
+        assert torch.allclose(loss2, model(**batch).loss, atol=1e-6)     # stock loss
+        assert trainer.args.learning_rate == lr_before
+        loss3 = trainer.compute_loss(model, dict(batch))                  # stays off, no re-raise
+        assert torch.allclose(loss3, loss2)
+        # a non-OOM error still surfaces
+        trainer2 = cls(model=model, args=args)
+        trainer2._f6_loss = lambda *a, **k: (_ for _ in ()).throw(OSError(28, "No space left on device"))
+        try:
+            trainer2.compute_loss(model, dict(batch))
+            raise AssertionError("OSError should propagate")
+        except OSError:
+            pass
+        # a model whose forward has no logits_to_keep goes to logits mode
+        trainer3 = cls(model=model, args=args)
+        trainer3._f6_hook.remove()
+        trainer3._f6_mode = "logits"
+        loss4 = trainer3.compute_loss(model, dict(batch))
+        assert torch.allclose(loss4, loss.detach(), atol=1e-6)
+    print(f"[ok] PerExampleLoss{Trainer.__name__}: hidden path, grads, OOM fail-safe "
+          f"(transformers {transformers.__version__})")
 
 
 if __name__ == "__main__":

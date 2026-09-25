@@ -26,13 +26,16 @@ def _clear_env():
 def test_flags_defaults_old_values_and_master():
     _clear_env()
     assert P.flag_on("SN56_EVAL_SKIP_FIX") and P.flag_on("SN56_TIME_PLAN")
-    assert not P.flag_on("SN56_LR_SEARCH") and not P.flag_on("SN56_NEFTUNE")
+    # F3 (measured 21-25 Sep): the search is on by default; LR_MULT scales its pick
+    assert P.flag_on("SN56_LR_SEARCH") and not P.flag_on("SN56_NEFTUNE")
     assert not P.flag_on("SN56_PER_EXAMPLE_LOSS")
     assert P.v5_pack_setting() == "auto" and P.max_epochs() == 4.0 and P.flag_float("SN56_LR_MULT") == 1.0
-    # one env var per flag restores the inherited path
-    os.environ["SN56_LR_SEARCH"] = "1"
+    # one env var per flag restores the inherited path / the A/B arm
+    os.environ["SN56_LR_SEARCH"] = "0"
     os.environ["SN56_V5_PACK"] = "0"
-    assert P.flag_on("SN56_LR_SEARCH") and P.v5_pack_setting() == "0"
+    assert not P.flag_on("SN56_LR_SEARCH") and P.v5_pack_setting() == "0"
+    os.environ["SN56_LR_MULT"] = "2"
+    assert abs(P.lr_for_batch(1.25e-4, 64, 64, P.flag_float("SN56_LR_MULT")) - 2.5e-4) < 1e-12
     # garbage falls back to the default, not to "on"
     os.environ["SN56_NEFTUNE"] = "maybe"
     assert not P.flag_on("SN56_NEFTUNE")
@@ -197,6 +200,141 @@ def test_time_helpers_roundtrip():
     assert P.fmt_utc(ts) == "2026-09-28 11:00:00"
     assert P.fmt_utc(ts - 60 * 9) == "2026-09-28 10:51:00"
     print("[ok] UTC helpers")
+
+
+# ── The tail (25 Sep failures) ──────────────────────────────────────────────
+# P-A: 3B (6.17 GB bf16), 1.5h, 8.4 s/step at bs 34 x ga 2, 186 packed dev
+# blocks, 8 soup snapshots. text_trainer's end_time is the kill minus 180 s.
+# The old trigger sat at T-5.8min (3 min + ~166 s dev-pass), which never
+# covered the soup; the run then died on a full disk and its retries
+# re-planned 20 and 10 steps into the kill.
+KILL_A = 5400.0
+END_A = KILL_A - 180.0
+NOW_A = 4 * 60.0              # planning happens ~4 min after the start
+PARAMS_3B = 3_085_000_000
+
+
+def _tail_a(write_bps, **kw):
+    return P.tail_plan(now_ts=NOW_A, end_ts=END_A, t_per_step=8.4, n_params=PARAMS_3B,
+                       n_dev_rows=186, world_size=1, grad_accum=2, per_device_bs=34,
+                       write_bps=write_bps, soup_pool=8, **kw)
+
+
+def test_3b_1p5h_tail_leaves_submission_before_the_kill():
+    # the pod's measured disk (6.17 GB in ~7 s) and the brief's 60-90 s save
+    for write_bps, label in ((0.85e9, "0.85GB/s"), (6.17e9 / 75, "75s/save")):
+        tail = _tail_a(write_bps)
+        assert tail["n_soup"] == 8 and tail["devpass"] and not tail["shrunk"], tail
+        parts = (tail["step_s"] + tail["eval_s"] + tail["save_s"] + tail["copy_s"] + tail["persist_s"]
+                 + tail["soup_s"] + tail["devpass_s"] + tail["safety_s"])
+        assert abs(tail["reserve_s"] - parts) < 1e-9
+        assert tail["reserve_s"] > 5.8 * 60                       # more than the old T-5.8min
+        assert tail["copy_s"] == 2 * tail["save_s"]               # read + write
+        assert 10 <= tail["eval_s"] <= 30                         # measured 11-27 s per eval
+        # the reserve scales with the disk: a 75 s save costs ~5 extra saves
+        # the planned tail, walked at the planned costs: last write >= 3 min
+        # + safety before the kill
+        sim = P.simulate_tail(tail, END_A)
+        assert sim["margin_s"] >= tail["safety_s"] - 1e-6, sim
+        assert KILL_A - sim["last_write_ts"] >= 180 + tail["safety_s"] - 1e-6
+        # a disk 1.5x slower and steps 1.3x slower than measured: the in-tail
+        # deadlines cut the soup / dev-pass, the last write still precedes end_time
+        slow = P.simulate_tail(tail, END_A, step_scale=1.3, save_scale=1.5)
+        assert slow["last_write_ts"] < END_A, slow
+        # the step plan ends at the trigger, net of the periodic eval+save cost
+        eval_cost = tail["eval_s"] + tail["save_s"] + 0.5 * tail["copy_s"]
+        p = P.plan_time_budget(now_ts=NOW_A, stop_ts=tail["trigger_ts"], t_per_step=8.4, steps_per_epoch=115,
+                               max_epochs=4, warmup_cap=90, eval_cost_s=eval_cost, periodic_save_steps=500)
+        assert p["train_s"] + p["eval_overhead_s"] <= p["available_s"] + 8.4
+        # the pod's disk: most of the 1.5h is trained; a 75 s/save disk makes
+        # every 20-step eval point cost ~170 s and the plan pays for it in steps
+        assert p["planned_steps"] >= (400 if write_bps > 0.5e9 else 200), p
+        print(f"[ok] 3B/1.5h ({label}): reserve {tail['reserve_s']:.0f}s "
+              f"(save {tail['save_s']:.0f}s, soup {tail['soup_s']:.0f}s, dev-pass {tail['devpass_s']:.0f}s), "
+              f"{p['planned_steps']} steps, last write {KILL_A - sim['last_write_ts']:.0f}s before the kill")
+    # the old rule for the same run was the logged T-5.8min (3 min + the
+    # dev-pass estimate); the priced tail is longer at the pod's disk rate
+    old_reserve = 60 * (3 + P.devpass_reserve(186, 1, 8.4, 2, 34)[1])
+    assert abs(old_reserve - 5.8 * 60) < 6 and _tail_a(0.85e9)["reserve_s"] > old_reserve
+
+
+def test_2h_task_soup_gets_its_budget():
+    # P-D (25 Sep, 2h): 1.336 s/step at bs 3 x ga 4, 348 dev blocks, 5.39 GB
+    # weights, 8 snapshots. Old trigger T-6.3min: the soup ran out of time
+    # after 5 candidates, the dev-pass was skipped (139 s left < 197 s).
+    end, now = 7200.0 - 180.0, 6 * 60.0
+    tail = P.tail_plan(now_ts=now, end_ts=end, t_per_step=1.336, n_params=2_695_000_000, n_dev_rows=348,
+                       grad_accum=4, per_device_bs=3, write_bps=0.73e9, soup_pool=8)
+    assert tail["n_soup"] == 8 and tail["devpass"] and not tail["shrunk"], tail
+    assert tail["soup_s"] >= 8 * tail["eval_s"]                   # seed + 7 candidates, each an eval
+    assert tail["reserve_s"] > 6.3 * 60
+    # the old rule: T-6.3min, soup = half of what was left after the final
+    # eval + save -> fewer than the 8 candidates (5 were evaluated on the pod)
+    old_soup = 0.5 * (6.3 * 60 - tail["step_s"] - tail["eval_s"] - tail["save_s"] - tail["copy_s"])
+    assert tail["eval_s"] * 4 < old_soup < tail["soup_s"], (old_soup, tail["soup_s"])
+    # the soup deadline leaves the dev-pass its full budget and the margin
+    assert tail["soup_deadline_ts"] + tail["devpass_s"] + tail["safety_s"] <= end + 1e-6
+    sim = P.simulate_tail(tail, end)
+    assert sim["margin_s"] >= tail["safety_s"] - 1e-6
+    # at the planned costs every candidate fits before the soup deadline
+    t = tail["trigger_ts"] + tail["step_s"] + tail["eval_s"] + tail["save_s"] + tail["copy_s"] + tail["eval_s"]
+    for _ in range(7):
+        t += tail["merge_s"] + tail["eval_s"]
+    assert t <= tail["soup_deadline_ts"] - tail["persist_s"] + 1e-6
+    print(f"[ok] 2h: soup budget {tail['soup_s']:.0f}s for 8 snapshots, dev-pass {tail['devpass_s']:.0f}s, "
+          f"reserve {tail['reserve_s'] / 60:.1f}min (was 6.3)")
+
+
+def test_tail_shrinks_soup_first_then_devpass_never_the_floor():
+    # a 3B run with only 20 min left: the tail may take 25% -> soup trimmed
+    tail = P.tail_plan(now_ts=0, end_ts=1200, t_per_step=8.4, n_params=PARAMS_3B, n_dev_rows=186,
+                       grad_accum=2, per_device_bs=34, write_bps=0.85e9, soup_pool=8)
+    assert 1 < tail["n_soup"] < 8 and tail["devpass"] and tail["shrunk"], tail
+    assert tail["reserve_s"] <= tail["cap_s"] + 1e-9
+    # a CPU-smoke-sized window: no soup, no dev-pass, but the floor stays
+    tiny = P.tail_plan(now_ts=60, end_ts=300, t_per_step=0.2, n_params=1_000_000, n_dev_rows=40,
+                       grad_accum=1, per_device_bs=2, write_bps=0.5e9, soup_pool=8)
+    assert tiny["n_soup"] == 1 and not tiny["devpass"] and tiny["shrunk"], tiny
+    floor = tiny["step_s"] + tiny["eval_s"] + tiny["save_s"] + tiny["copy_s"] + tiny["persist_s"] + tiny["safety_s"]
+    assert abs(tiny["reserve_s"] - floor) < 1e-9 and tiny["soup_s"] == 0 and tiny["devpass_s"] == 0
+    assert tiny["reserve_s"] > tiny["cap_s"]                       # the floor is never cut
+    # no dev set: nothing to eval, soup or dev-pass
+    nodev = P.tail_plan(now_ts=0, end_ts=3600, t_per_step=1.0, n_params=5e8, n_dev_rows=0)
+    assert nodev["n_soup"] == 1 and not nodev["devpass"] and nodev["eval_s"] == 0
+    print(f"[ok] shrink: 20min/3B -> soup {tail['n_soup']}, dev-pass kept; tiny window -> floor only")
+
+
+def test_late_attempt_guard_on_the_measured_retries():
+    # P-A's retries: end_time 11:16:54; attempt 2 started 11:05:23 (691 s
+    # left), attempt 3 11:11:19 (335 s), 4 11:14:00, 5 11:16:33, 6 11:19:06.
+    plan = dict(t_per_step=8.4, reserve_s=_tail_a(0.85e9)["reserve_s"])
+    for left in (691.0, 335.0, 174.0, 21.0, -132.0):
+        assert P.late_attempt(left, True, **plan), left           # keep the step-230 submission
+    assert not P.late_attempt(40 * 60.0, True, **plan)             # 40 min left: a real retry
+    assert not P.late_attempt(21.0, False, **plan)                 # nothing to keep: retry as before
+    assert P.late_attempt(600.0, True) and not P.late_attempt(1000.0, True)   # no measurements: 15 min
+    print("[ok] late-attempt guard: every 25 Sep retry keeps the submission")
+
+
+def test_submission_and_disk_helpers(tmp_root=None):
+    import shutil
+    import tempfile
+    root = tempfile.mkdtemp(prefix="sn56_plan_test_")
+    try:
+        sub = os.path.join(root, "sub")
+        assert not P.submission_is_valid(sub) and not P.submission_is_valid("")
+        os.makedirs(sub)
+        open(os.path.join(sub, "config.json"), "w").close()
+        assert not P.submission_is_valid(sub)                      # weights missing
+        open(os.path.join(sub, "model.safetensors"), "w").close()
+        assert P.submission_is_valid(sub)
+        bps = P.measure_write_bps(root, size_bytes=8 * 1024 * 1024)
+        assert P.WRITE_BPS_MIN <= bps <= P.WRITE_BPS_MAX and not any(n.startswith(".sn56_write_probe") for n in os.listdir(root))
+        assert P.measure_write_bps(os.path.join(root, "nope", "x"), size_bytes=1024) >= P.WRITE_BPS_MIN
+        assert P.save_time_s(PARAMS_3B, 0.85e9) > P.save_time_s(PARAMS_3B, 3e9) > P.SAVE_FIXED_S
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    print(f"[ok] submission check + write probe ({bps / 1e6:.0f} MB/s here)")
 
 
 if __name__ == "__main__":
