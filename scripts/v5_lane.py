@@ -8,8 +8,8 @@ so such a task is evaluable — the only thing that cannot load the model is a 4
 trainer. Rather than upgrade (and re-validate) the whole training stack, the image
 carries a second venv (/workspace/v5_py, transformers 5 + peft, sharing the system
 torch/flash-attn/bitsandbytes) and `text_trainer` re-execs itself into it only when
-the model_type is unknown to the main install. Every other task runs exactly as
-before.
+the model_type is unknown or its RoPE cannot be represented faithfully on v4.
+Ordinary v5 RoPE dictionaries are normalized in a private model view by rope_compat instead.
 
 Behavioural differences inside the lane (see instruct_config.get_training_json):
 the 4.x Flash-Attention seq-id-mask packing monkeypatch is never used here. For
@@ -55,7 +55,12 @@ def model_type_of(model_path: str):
 
 
 def needs_v5(model_path: str) -> bool:
-    """True when the *current* transformers cannot build a config for this model."""
+    """True when architecture or RoPE semantics require the newer stack."""
+    from rope_compat import requires_v5_rope
+
+    with open(os.path.join(model_path, "config.json")) as stream:
+        if requires_v5_rope(json.load(stream)):
+            return transformers_major() < 5
     model_type = model_type_of(model_path)
     if not model_type:
         return False
@@ -69,15 +74,17 @@ def needs_v5(model_path: str) -> bool:
 def maybe_reexec(model_path: str, argv) -> None:
     """Replace this process with the v5 venv's interpreter when the model needs it.
 
-    No-op when already in the lane, when the model loads on the main install, or
-    when the image has no v5 venv (then the run proceeds — and fails — as before).
+    No-op when already in the lane or compatible with the main install.
+    Fail explicitly when the required v5 interpreter is absent.
     """
-    if is_v5_lane() or not needs_v5(model_path) or not os.path.exists(V5_PYTHON):
+    if is_v5_lane() or not needs_v5(model_path):
         return
+    if not os.path.exists(V5_PYTHON):
+        raise RuntimeError("Model architecture or RoPE requires the missing v5 interpreter")
     import transformers
 
     print(
-        f"[sn56][v5-lane] model_type={model_type_of(model_path)!r} is unknown to "
+        f"[sn56][v5-lane] model_type={model_type_of(model_path)!r} requires a newer RoPE/architecture implementation than "
         f"transformers {transformers.__version__}; re-exec under {V5_PYTHON}",
         flush=True,
     )
