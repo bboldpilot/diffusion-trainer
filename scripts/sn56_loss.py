@@ -31,6 +31,20 @@ lm_head / logits_to_keep, or a head the check below cannot reproduce) runs in
 logits fit. An OOM inside this loss, whichever path, switches the trainer to
 the stock loss for the rest of the run instead of escaping: F6 never reaches
 the retry ladder and never changes the LR.
+
+SN56_F6_GLOBAL (default off): under DDP each rank used to normalise by its OWN
+denominator (n_r examples, or sum n_i^(1-alpha)) before DDP averaged the
+gradients, i.e. mean_r(N_r/D_r) instead of the single-GPU objective sum N / sum D.
+With the flag the denominators are all-reduced first (from the labels only, before
+any forward, on every rank and every training call whatever the F6 mode, so the
+collective can never be skipped by one rank) and each rank returns R*N_r/D, whose
+DDP average is exactly sum N / sum D. One process: unchanged. The accumulation
+window is still normalised per micro-batch (grad_accum is 1 on these runs).
+
+SN56_PER_EXAMPLE_ALPHA (K1-b, default 1.0): example i's tokens are weighted
+n_i^-alpha and the batch loss is sum_i n_i^-alpha * S_i / sum_i n_i^(1-alpha)
+(S_i = summed response CE). alpha=1 is the per-example mean above (that code
+path is unchanged); alpha=0 is the stock token mean; 0.5 sits between.
 """
 
 import gc
@@ -97,16 +111,44 @@ def _response_positions(labels, position_ids=None, attention_mask=None):
     return idx, tgt.index_select(0, idx), seg.index_select(0, idx)
 
 
-def _per_example_from_tokens(ce, seg_sel):
-    """(sum over examples of the per-example mean token CE, number of examples)."""
+def _per_example_from_tokens(ce, seg_sel, alpha: float = 1.0):
+    """(sum over examples of the per-example mean token CE, number of examples);
+    for alpha != 1, (sum_i n_i^-alpha * S_i, sum_i n_i^(1-alpha)) instead."""
     uniq, inv = torch.unique(seg_sel, return_inverse=True)
     sums = torch.zeros(uniq.numel(), dtype=ce.dtype, device=ce.device).index_add_(0, inv, ce)
     counts = torch.zeros(uniq.numel(), dtype=ce.dtype, device=ce.device).index_add_(
         0, inv, torch.ones_like(ce))
-    return (sums / counts).sum(), int(uniq.numel())
+    if alpha == 1.0:
+        return (sums / counts).sum(), int(uniq.numel())
+    w = counts.detach().double().pow(-alpha)
+    return (sums * w.to(sums.dtype)).sum(), float((counts.detach().double() * w).sum())
 
 
-def per_example_ce(logits, labels, position_ids=None, attention_mask=None, chunk_tokens: int = 8192):
+def local_denominator(labels, position_ids=None, attention_mask=None, alpha: float = 1.0):
+    """The batch's F6 denominator from the labels alone (float64 scalar on labels' device):
+    number of examples with response tokens (alpha=1) or sum_i n_i^(1-alpha)."""
+    idx, _tgt, seg = _response_positions(labels, position_ids, attention_mask)
+    if idx.numel() == 0:
+        return torch.zeros((), dtype=torch.float64, device=labels.device)
+    uniq, inv = torch.unique(seg, return_inverse=True)
+    if alpha == 1.0:
+        return torch.tensor(float(uniq.numel()), dtype=torch.float64, device=labels.device)
+    counts = torch.zeros(uniq.numel(), dtype=torch.float64, device=labels.device).index_add_(
+        0, inv, torch.ones(inv.numel(), dtype=torch.float64, device=labels.device))
+    return (counts * counts.pow(-alpha)).sum()
+
+
+def global_denominator(labels, position_ids=None, attention_mask=None, alpha: float = 1.0):
+    """(sum of local_denominator over the DDP ranks, world size). Every rank must call it."""
+    import torch.distributed as dist
+    d = local_denominator(labels, position_ids, attention_mask, alpha)
+    world = dist.get_world_size()
+    dist.all_reduce(d, op=dist.ReduceOp.SUM)
+    return float(d), world
+
+
+def per_example_ce(logits, labels, position_ids=None, attention_mask=None, chunk_tokens: int = 8192,
+                   alpha: float = 1.0):
     """(sum over examples of per-example mean token CE, number of examples)
     from materialised logits. CE in float32, response tokens only, in chunks
     to bound the float32 copy."""
@@ -119,7 +161,7 @@ def per_example_ce(logits, labels, position_ids=None, attention_mask=None, chunk
         sl = idx[start:start + chunk_tokens]
         ce_parts.append(F.cross_entropy(lg.index_select(0, sl).float(),
                                         tgt[start:start + chunk_tokens], reduction="none"))
-    return _per_example_from_tokens(torch.cat(ce_parts), seg)
+    return _per_example_from_tokens(torch.cat(ce_parts), seg, alpha)
 
 
 def _chunk_ce(h, weight, bias, tgt, softcap):
@@ -149,7 +191,7 @@ def linear_ce_chunked(hidden_rows, weight, bias, targets, chunk_rows: int = CHUN
 
 
 def per_example_ce_from_hidden(hidden, weight, bias, labels, position_ids=None, attention_mask=None,
-                               chunk_rows: int = CHUNK_ROWS, softcap=None):
+                               chunk_rows: int = CHUNK_ROWS, softcap=None, alpha: float = 1.0):
     """per_example_ce without the (B, T, V) logits: the head is applied to the
     response positions only, chunked and checkpointed."""
     idx, tgt, seg = _response_positions(labels, position_ids, attention_mask)
@@ -157,7 +199,7 @@ def per_example_ce_from_hidden(hidden, weight, bias, labels, position_ids=None, 
         return hidden.sum() * 0.0, 0
     rows = hidden[:, :-1, :].reshape(-1, hidden.shape[-1]).index_select(0, idx)
     ce = linear_ce_chunked(rows, weight, bias, tgt, chunk_rows, softcap)
-    return _per_example_from_tokens(ce, seg)
+    return _per_example_from_tokens(ce, seg, alpha)
 
 
 def cap_batch_for_logits(per_device_bs: int, grad_accum: int, max_length: int, vocab: int,
@@ -176,10 +218,25 @@ def cap_batch_for_logits(per_device_bs: int, grad_accum: int, max_length: int, v
     return max_rows, max(1, -(-eff // max_rows))
 
 
-def make_per_example_trainer(base_cls):
-    """Subclass of the given Trainer whose loss is the per-example mean."""
+def _ddp_world() -> int:
+    try:
+        import torch.distributed as dist
+        return dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+    except Exception:
+        return 1
+
+
+def make_per_example_trainer(base_cls, alpha: float = 1.0, global_norm: bool = False):
+    """Subclass of the given Trainer whose loss is the per-example mean
+    (alpha=1) or the n_i^-alpha weighted mean (module doc); global_norm =
+    SN56_F6_GLOBAL (denominator summed over DDP ranks)."""
+    _alpha = float(alpha)
+    _global = bool(global_norm)
 
     class PerExampleLossTrainer(base_cls):
+        f6_alpha = _alpha
+        f6_global = _global
+
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             # num_items_in_batch (a token count) does not apply to this loss; let
@@ -273,7 +330,7 @@ def make_per_example_trainer(base_cls):
                 rel = (ref - mine).norm() / ref.norm().clamp_min(1e-6)
             return bool(torch.isfinite(rel)) and rel.item() <= HEAD_CHECK_REL_TOL, float(rel)
 
-        def _f6_loss(self, model, inputs, return_outputs):
+        def _f6_loss(self, model, inputs, return_outputs, gden=None):
             labels = inputs["labels"]
             fwd = {k: v for k, v in inputs.items() if k != "labels"}
             if self._f6_mode == "hidden":
@@ -284,32 +341,45 @@ def make_per_example_trainer(base_cls):
                 if hidden is None or hidden.dim() != 3 or tuple(hidden.shape[:2]) != tuple(labels.shape):
                     self._f6_mode = "logits"
                     self._f6_log("estado oculto não capturado: modo logits")
-                    return self._f6_loss(model, inputs, return_outputs)
+                    return self._f6_loss(model, inputs, return_outputs, gden)
                 if not self._f6_checked:
                     self._f6_checked = True
                     ok, rel = self._f6_head_check(outputs, hidden)
                     if not ok:
                         self._f6_mode = "logits"
                         self._f6_log(f"cabeça não padrão (erro rel {rel:.3f}): modo logits")
-                        return self._f6_loss(model, inputs, return_outputs)
+                        return self._f6_loss(model, inputs, return_outputs, gden)
                 head = self._f6_head
                 total, n = per_example_ce_from_hidden(
                     hidden, head.weight, getattr(head, "bias", None), labels,
-                    inputs.get("position_ids"), inputs.get("attention_mask"), softcap=self._f6_softcap)
+                    inputs.get("position_ids"), inputs.get("attention_mask"), softcap=self._f6_softcap,
+                    alpha=self.f6_alpha)
             else:
                 outputs = model(**fwd)
                 logits = outputs["logits"] if isinstance(outputs, dict) else outputs[0]
                 total, n = per_example_ce(logits, labels, inputs.get("position_ids"),
-                                          inputs.get("attention_mask"))
-            loss = total / max(1, n)
+                                          inputs.get("attention_mask"), alpha=self.f6_alpha)
+            if gden is not None:
+                # SN56_F6_GLOBAL: R * N_r / sum_s D_s, so DDP's average is sum N / sum D
+                d_glob, world = gden
+                loss = total * (world / d_glob) if d_glob > 0 else total * 0.0
+            else:
+                loss = total / max(1, n) if self.f6_alpha == 1.0 else total / (n if n > 0 else 1.0)
             return (loss, outputs) if return_outputs else loss
 
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            gden = None
+            if (self.f6_global and "labels" in inputs and getattr(model, "training", False)
+                    and _ddp_world() > 1):
+                # collective first, from the labels only: every rank runs it on every
+                # training call, whatever its F6 mode (an "off" rank still joins)
+                gden = global_denominator(inputs["labels"], inputs.get("position_ids"),
+                                          inputs.get("attention_mask"), self.f6_alpha)
             if "labels" not in inputs or self._f6_mode == "off":
                 return super().compute_loss(model, inputs, return_outputs=return_outputs,
                                             num_items_in_batch=num_items_in_batch)
             try:
-                return self._f6_loss(model, inputs, return_outputs)
+                return self._f6_loss(model, inputs, return_outputs, gden)
             except Exception as e:
                 if not is_oom(e):
                     raise

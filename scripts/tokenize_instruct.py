@@ -183,6 +183,7 @@ def split_dataset(
     dev_size: int = 200,
     max_data_size: int = -1,
     hours_to_complete: float = 2.0,
+    dev_testlike: bool = False,
 ):
     """Split the dataset into train and dev with stratification and near-dedup."""
     from val_split import stratified_split, concat_all_text
@@ -190,32 +191,44 @@ def split_dataset(
     with open(total_data_path, "r") as file:
         data = json.load(file)
 
-    random.seed(seed)
-    random.shuffle(data)
-    if max_data_size > 0:
-        data = data[:max_data_size]
+    if dev_testlike:
+        from sn56_dev_testlike import split_rows, unique_rows
+        # Dedup source rows before optional subsampling; do not group near-dups.
+        data = unique_rows(data)
+        if max_data_size > 0:
+            data = data.copy()
+            random.Random(seed).shuffle(data)
+            data = data[:max_data_size]
+        data = remove_empty_output_items(data)
+        dev_items, train_items = split_rows(data, seed=seed)
+        print(f"[sn56][dev_testlike] dev={len(dev_items)} train={len(train_items)}")
+    else:
+        random.seed(seed)
+        random.shuffle(data)
+        if max_data_size > 0:
+            data = data[:max_data_size]
 
-    # Filter BEFORE split so stratification sees clean data
-    before_len = len(data)
-    data = remove_empty_output_items(data)
-    n_removed = before_len - len(data)
-    if n_removed:
-        print(f"Removed {n_removed} empty output items before split")
+        # Filter BEFORE split so stratification sees clean data
+        before_len = len(data)
+        data = remove_empty_output_items(data)
+        n_removed = before_len - len(data)
+        if n_removed:
+            print(f"Removed {n_removed} empty output items before split")
 
-    # Dev size: ~3% of dataset, capped at 1000 and at most 20% of total data.
-    # Bigger dev set = less eval noise, which checkpoint averaging selection
-    # relies on. Small datasets are unchanged (the 20% floor protects training
-    # data); only larger datasets get the bigger, more reliable dev set.
-    dev_size = min(1000, max(min(400, len(data) // 5), len(data) // 33))
-    print(f"Escolhendo {dev_size} pro teste (dados={len(data)})")
+        # Dev size: ~3% of dataset, capped at 1000 and at most 20% of total data.
+        # Bigger dev set = less eval noise, which checkpoint averaging selection
+        # relies on. Small datasets are unchanged (the 20% floor protects training
+        # data); only larger datasets get the bigger, more reliable dev set.
+        dev_size = min(1000, max(min(400, len(data) // 5), len(data) // 33))
+        print(f"Escolhendo {dev_size} pro teste (dados={len(data)})")
 
-    dev_items, train_items = stratified_split(
-        items=data,
-        dev_size=dev_size,
-        text_fn=concat_all_text,
-        difficulty_fn=_instruct_output_length,
-        seed=seed,
-    )
+        dev_items, train_items = stratified_split(
+            items=data,
+            dev_size=dev_size,
+            text_fn=concat_all_text,
+            difficulty_fn=_instruct_output_length,
+            seed=seed,
+        )
 
     with open(train_data_path, "w") as file:
         json.dump(train_items, file, ensure_ascii=False)
@@ -278,6 +291,7 @@ def main(training_request_path: str):
         dev_path,
         max_data_size=max_data_size,
         hours_to_complete=hours,
+        dev_testlike=training_request["train_request"].get("dev_testlike", False),
     )
     
     config_path = "test_axolotl.yml"

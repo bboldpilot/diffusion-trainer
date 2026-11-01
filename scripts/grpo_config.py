@@ -1,3 +1,5 @@
+import os
+from sn56_plan import flag_on
 from model_utility import (
     get_model_architecture,
     get_model_num_params,
@@ -338,6 +340,11 @@ def get_training_json(train_info: dict) -> dict:
 
         elif config["label"] == "13_15_b":
             run_config["batch_size"] = 12
+
+    if flag_on("SN56_GRPO_EXPO"):
+        # reserve wall-clock for the post-training extrapolation + selection (grpo_expo.py;
+        # on by default since 30 Oct: the validator passes no SN56_* env to the container)
+        train_request["save_before_remaining_time"] += int(os.environ.get("SN56_GRPO_EXPO_RESERVE_MIN", "8"))
 
     # Scale batch size with prompt length — memory scales linearly with total
     # sequence length (prompt + completion). Reference: default TRL GRPOConfig

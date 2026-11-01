@@ -160,6 +160,27 @@ def main():
     train_ds = get_dataset(train_path, train_request["dataset_type"])
     dev_ds = get_dataset(dev_path, train_request["dataset_type"])
 
+    # DPO arm knobs (sn56_dpo_knobs.py; every default = the inherited path).
+    import sn56_dpo_knobs
+    import sn56_plan
+    _knobs = sn56_dpo_knobs.read_knobs()
+    log_info(f"[sn56][dpoarm] {sn56_dpo_knobs.summary(_knobs)}")
+    _dpo_select = sn56_plan.flag_str("SN56_DPO_SELECT")
+    # SN56_DPO_GATE_SPLIT: carve a gate split out of the training rows (content-hash order, the
+    # same rows in every run of the task); with SN56_DPO_SELECT=opp it is the selection set.
+    gate_ds, gate_ids = None, None
+    if _knobs["gate_split"] > 0:
+        from sn56_dpo_select import dataset_ids
+        _ids = dataset_ids(train_ds)
+        _gi, _ti = sn56_dpo_knobs.gate_split(_ids, _knobs["gate_split"])
+        if _gi:
+            gate_ds, gate_ids = train_ds.select(_gi), [_ids[i] for i in _gi]
+            train_ds = train_ds.select(_ti)
+        log_info(f"[sn56][portão] split do portão {len(_gi)} pares fora do treino ({len(train_ds)} treinam)")
+    _opp_mode = _dpo_select == "opp" and gate_ds is not None
+    if _dpo_select == "opp" and not _opp_mode:
+        log_info("[sn56][portão] SN56_DPO_SELECT=opp sem SN56_DPO_GATE_SPLIT: seleção pela média")
+
     log_info(f"nós={training_args.world_size}")
     total_steps_per_epoch = len(train_ds) // (
         training_args.per_device_train_batch_size
@@ -246,6 +267,22 @@ def main():
     if peft_config is None:  # this is full-weight training
         # some model need to resize the token embeddings or encounter the size mismatch error; only for full-weight models
         resize_if_needed(train_request["model_name"], model, len(tokenizer))
+
+    # SN56_DPO_INIT: the policy starts from other weights (e.g. the task-local boss reproduction);
+    # the DPO reference must stay the task base (the validator scores against it), so pin it to a
+    # copy of the base BEFORE loading (TRL would otherwise copy the initialised policy).
+    if _knobs["init"]:
+        if peft_config is not None:
+            log_info("[sn56][init] SN56_DPO_INIT ignorado com PEFT")
+        else:
+            import copy as _copy
+            import sn56_dpo_opp
+            if ref_model is None:
+                ref_model = _copy.deepcopy(model)
+                ref_model.requires_grad_(False)
+            _ld = sn56_dpo_opp.load_weights_into(model, _knobs["init"])
+            log_info(f"[sn56][init] política <- {_knobs['init']} ({_ld['loaded']} tensores, "
+                     f"amarrados {len(_ld['tied_skipped'])}); referência = base")
 
     # Only resize token embeddings if not using LoRA
     # if peft_config is None:  # full-weights training
@@ -340,33 +377,66 @@ def main():
     if ckpt_avg is not None:
         ckpt_avg._submission_dir = train_request["submission_dir"]
 
-    trainer = DPOTrainer(
+    # K5 (SN56_DPO_SELECT=gate): eval_loss = the paired-gate bound against the
+    # base proxy (sn56_dpo_select.py); SN56_DPO_DUMP_DIR records every dev
+    # evaluation's per-pair vector, also under the default mean selection.
+    # SN56_DPO_SELECT=opp (with a gate split): the same subclass, eval set = the gate split,
+    # eval_loss = the verbatim gate (both bounds + scalar guard) against the cached opponent vector.
+    _dpo_cls = DPOTrainer
+    _dpo_dump = os.environ.get("SN56_DPO_DUMP_DIR", "").strip()
+    if _dpo_select == "gate" or _opp_mode or _dpo_dump:
+        from sn56_dpo_select import make_gate_dpo_trainer
+        _dpo_cls = make_gate_dpo_trainer(DPOTrainer, dump_dir=_dpo_dump, select=_dpo_select == "gate" or _opp_mode)
+        log_info(f"[sn56][dposel] seleção={_dpo_select} dump={_dpo_dump or '-'}")
+    _eval_cb = CustomEvalSaveCallback(
+        WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
+        train_request["submission_dir"],
+        training_args.output_dir,
+        train_request["model_name"],
+        max_steps,
+        checking_step=checking_step,
+        total_steps_all_epochs=total_steps_all_epochs,
+        end_time=train_request["end_time"],
+        checking_mode=train_request.get("checking_mode", "none"),
+        use_reward_accuracy=False,
+    )
+    trainer = _dpo_cls(
         model=model,
         ref_model=ref_model,
         args=training_args,
         train_dataset=train_ds,
-        eval_dataset=dev_ds,
+        eval_dataset={"dev": dev_ds, "gate": gate_ds} if _opp_mode else dev_ds,
         processing_class=tokenizer,
         peft_config=peft_config,
         callbacks=[
             *([] if ckpt_avg is None else [ckpt_avg]),
-            CustomEvalSaveCallback(
-                WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
-                train_request["submission_dir"],
-                training_args.output_dir,
-                train_request["model_name"],
-                max_steps,
-                checking_step=checking_step,
-                total_steps_all_epochs=total_steps_all_epochs,
-                end_time=train_request["end_time"],
-                checking_mode=train_request.get("checking_mode", "none"),
-                use_reward_accuracy=False,
-            )
+            _eval_cb,
         ],
     )
 
     if ckpt_avg is not None:
         ckpt_avg.trainer = trainer
+
+    # Opponent mode: every training-time evaluation (best checkpoint, soup, overfit stop, scale)
+    # runs on the gate split against the opponent; the LR search's held-out batches and a dev-pass
+    # keep using dev, so the gate split is only ever SELECTED on.
+    _search_eval, _dev_eval = None, None
+    if _opp_mode:
+        import sn56_dpo_opp
+        _dev_eval = trainer.eval_dataset["dev"]
+        trainer.eval_dataset = trainer.eval_dataset["gate"]
+        _search_eval = _dev_eval
+        _opp_vec = None
+        try:
+            _opp_vec = sn56_dpo_opp.opponent_vector(
+                trainer, gate_ids, vec_path=_knobs["opp_vec"], model_dir=_knobs["opp_model"], log=log_info)
+        except Exception as _e:
+            log_info(f"[sn56][oponente] falhou ({_e})")
+        if _opp_vec is None:
+            trainer.sn56_select = False
+            log_info("[sn56][oponente] sem vetor: seleção pela média no split do portão")
+        else:
+            trainer.sn56_opp = _opp_vec
 
     # DPO/GRPO lr_search: use trainer.training_step instead of raw model(**batch).
     # DPO collator produces paired chosen/rejected batches that only the DPOTrainer
@@ -424,18 +494,25 @@ def main():
         # capped at the dpo_config bucket); the held-out-scored sweep + extend-low
         # refine around it. No extra scaling here — that would double-correct.
         try:
-            best_lr, _t_per_step = run_lr_search(
-                model=model,
-                train_dataloader=search_loader,
-                initial_lr=training_args.learning_rate,
-                hours_to_complete=train_request["hours_to_complete"],
-                grad_accum_steps=training_args.gradient_accumulation_steps,
-                max_grad_norm=training_args.max_grad_norm,
-                dataloader_factory=_halve_batch_dataloader,
-                trainer=trainer,
-                steps_per_epoch=total_steps_per_epoch,
-                eval_dataloader=trainer.get_eval_dataloader(),
-            )
+            if _knobs["lr"] is not None:
+                # SN56_DPO_LR: fixed LR, no search. No step timing either
+                # (measure_step_time runs plain LM batches, not DPO pairs), so
+                # the time-based epoch plan below is skipped (_t_per_step None).
+                best_lr, _t_per_step = float(_knobs["lr"]), None
+                log_info(f"[sn56][farejando] busca pulada (SN56_DPO_LR): lr={best_lr:.2e}")
+            else:
+                best_lr, _t_per_step = run_lr_search(
+                    model=model,
+                    train_dataloader=search_loader,
+                    initial_lr=training_args.learning_rate,
+                    hours_to_complete=train_request["hours_to_complete"],
+                    grad_accum_steps=training_args.gradient_accumulation_steps,
+                    max_grad_norm=training_args.max_grad_norm,
+                    dataloader_factory=_halve_batch_dataloader,
+                    trainer=trainer,
+                    steps_per_epoch=total_steps_per_epoch,
+                    eval_dataloader=trainer.get_eval_dataloader(_search_eval),   # None = the eval set; opp mode: dev
+                )
         finally:
             trainer.accelerator.gather_for_metrics = _orig_gather
             # Clear stale metrics accumulated during lr_search trials
@@ -536,18 +613,71 @@ def main():
                     training_args.eval_steps = int(_epoch_info[2].item())
                     training_args.save_steps = int(_epoch_info[2].item())
 
+    # ── DPO arm knobs: LR scale + schedule (defaults leave everything as planned) ──
+    if _knobs["lr_scale"] != 1.0:
+        _lr0 = training_args.learning_rate
+        training_args.learning_rate = _lr0 * _knobs["lr_scale"]
+        log_info(f"[sn56][dpoarm] lr {_lr0:.2e} x{_knobs['lr_scale']:g} -> {training_args.learning_rate:.2e}")
+    _sched = sn56_dpo_knobs.schedule(
+        _knobs, total_steps_per_epoch, training_args.num_train_epochs,
+        training_args.eval_steps, training_args.warmup_steps, is_final_run,
+    )
+    if _sched["changed"]:
+        training_args.num_train_epochs = _sched["epochs"]
+        training_args.warmup_steps = _sched["warmup_steps"]
+        if _sched["eval_steps"] is not None:
+            training_args.eval_steps = _sched["eval_steps"]
+            training_args.save_steps = _sched["eval_steps"]
+        if _sched["eval_skip_threshold"] is not None:
+            _eval_cb.sn56_eval_skip_threshold = _sched["eval_skip_threshold"]
+        _eval_cb.total_steps_all_epochs = _sched["total_steps_all_epochs"]
+        log_info(
+            f"[sn56][dpoarm] épocas={training_args.num_train_epochs} aquecimento={training_args.warmup_steps} "
+            f"eval a cada {training_args.eval_steps} passos a partir do passo {_eval_cb.sn56_eval_skip_threshold}"
+        )
+
     log_info("Bora treinar")
-    log_info(f"fiscalização a cada {training_args.eval_steps} passos, {len(dev_ds)} na prova")
+    log_info(f"fiscalização a cada {training_args.eval_steps} passos, {len(trainer.eval_dataset)} na prova")
     trainer.train()
+
+    # ── SN56_DPO_SCALE_CAL: margin-scale calibration on the still-unseen dev set ──
+    # Measured on the model the submission holds now (soup/best, persisted by
+    # AdaptiveTrainingCallback.on_train_end in ram mode), before the dev-pass
+    # trains on dev; the picked scale is applied to the final weights below.
+    _scale = None
+    if _knobs["scale_cal"]:
+        try:
+            import sn56_dpo_scale
+            _ok, _why = sn56_dpo_scale.supported(trainer, training_args.world_size)
+            if not (is_final_run and _avg_mode == "ram" and len(dev_ds) > 0):
+                _ok, _why = False, f"final={is_final_run}, modo={_avg_mode}, dev={len(dev_ds)}"
+            if _ok:
+                _score_fn = None
+                if _opp_mode and getattr(trainer, "sn56_opp", None) is not None:
+                    # opponent mode: the scale is one more selection candidate on the gate split
+                    from sn56_dpo_select import opp_gate_stats
+                    _score_fn = lambda v: opp_gate_stats(v, trainer.sn56_opp)["score"]  # noqa: E731
+                _scale = sn56_dpo_scale.calibrate(
+                    trainer, sn56_dpo_knobs.scale_grid(_knobs), _knobs["scale_min_gain"], log=log_info,
+                    report_path=os.path.join(_dpo_dump, "scale-cal.json") if _dpo_dump else "",
+                    score_fn=_score_fn,
+                )["alpha"]
+            else:
+                log_info(f"[sn56][escala] pulando ({_why})")
+        except Exception as _e:
+            _scale = None
+            log_info(f"[sn56][escala] calibração falhou ({_e}), sem escala")
 
     # ── Final dev-data pass (data maximization) ──
     # Same as instruct: from the best checkpoint, one low-LR epoch over the
     # held-out dev set (sharded DDP, training's effective batch), then atomic
     # weights-only save. run_dev_pass uses trainer.training_step, so the loss is
     # the proper DPO chosen/rejected + reference-model loss. Best-effort + gated.
+    _devfit_ok = True   # False only when a dev-pass started and raised (weights may be half-updated)
     try:
         _dev_n = len(dev_ds)
-        if is_final_run and _avg_mode == "ram" and _dev_n > 0:
+        if is_final_run and _avg_mode == "ram" and _dev_n > 0 and _knobs["devfit"]:
+            _devfit_ok = False
             from dev_pass import run_dev_pass
             _min_lr_rate = 0.25
             _kw = training_args.lr_scheduler_kwargs or {}
@@ -562,19 +692,59 @@ def main():
                 pass
             _min_lr = trainer.args.learning_rate * _min_lr_rate
             log_info(f"[sn56][devfit] {_dev_n} amostras de dev, 1 época @ lr={_min_lr:.2e}")
-            run_dev_pass(
-                trainer,
-                submission_dir=train_request["submission_dir"],
-                min_lr=_min_lr,
-                max_grad_norm=training_args.max_grad_norm,
-                train_per_device=training_args.per_device_train_batch_size,
-                train_grad_accum=training_args.gradient_accumulation_steps,
-                local_rank=LOCAL_RANK, log=log_info,
-            )
+            _sel_eval = trainer.eval_dataset
+            if _opp_mode:
+                trainer.eval_dataset = _dev_eval     # the dev-pass trains on dev, never on the gate split
+            try:
+                run_dev_pass(
+                    trainer,
+                    submission_dir=train_request["submission_dir"],
+                    min_lr=_min_lr,
+                    max_grad_norm=training_args.max_grad_norm,
+                    train_per_device=training_args.per_device_train_batch_size,
+                    train_grad_accum=training_args.gradient_accumulation_steps,
+                    local_rank=LOCAL_RANK, log=log_info,
+                )
+            finally:
+                trainer.eval_dataset = _sel_eval
+            _devfit_ok = True
         else:
-            log_info(f"[sn56][devfit] pulando (final={is_final_run}, modo={_avg_mode}, dev={_dev_n})")
+            log_info(f"[sn56][devfit] pulando (final={is_final_run}, modo={_avg_mode}, dev={_dev_n}, "
+                     f"devfit={int(bool(_knobs['devfit']))})")
     except Exception as _e:
         log_info(f"[sn56][devfit] dev-pass falhou ({_e}), mantendo melhor checkpoint")
+
+    if _scale is not None and _scale != 1.0:
+        if not _devfit_ok:
+            log_info(f"[sn56][escala] dev-pass falhou: escala {_scale:g} não aplicada")
+        else:
+            try:
+                import sn56_dpo_scale
+                if is_main_process(LOCAL_RANK):
+                    sn56_dpo_scale.apply_and_save(
+                        trainer, _scale, train_request["submission_dir"],
+                        keep_dir=_knobs["scale_keep_dir"], log=log_info,
+                    )
+            except Exception as _e:
+                log_info(f"[sn56][escala] aplicação falhou ({_e}), submissão sem escala")
+
+    # Opponent mode: re-score the FINAL weights (after soup / scale / dev-pass) on the gate split, so
+    # the reported opponent verdict is never stale.
+    if _opp_mode and getattr(trainer, "sn56_opp", None) is not None and is_main_process(LOCAL_RANK):
+        try:
+            import sn56_dpo_scale
+            from sn56_dpo_select import opp_gate_stats
+            _fin = opp_gate_stats(sn56_dpo_scale.dev_pair_losses(trainer), trainer.sn56_opp)
+            _keep = {k: v for k, v in _fin.items() if isinstance(v, (int, float, bool, str))}
+            log_info(f"[sn56][oponente] final no portão: média {_fin['mean_loss']:.5f} vs {_fin['opp_mean']:.5f}, "
+                     f"wr {_fin['win_rate']:.3f} (lb {_fin['win_rate_lower_bound']:.3f}), gap "
+                     f"{_fin['mean_gap_nats']:+.5f} (lb {_fin['mean_gap_lower_bound']:+.5f}), passa={_fin['takes_task']}")
+            if _dpo_dump:
+                os.makedirs(_dpo_dump, exist_ok=True)
+                with open(os.path.join(_dpo_dump, "opp-final.json"), "w") as f:
+                    json.dump(_keep, f, indent=1)
+        except Exception as _e:
+            log_info(f"[sn56][oponente] re-pontuação final falhou ({_e})")
 
     if is_main_process(LOCAL_RANK):
         with open(os.path.join(training_args.output_dir, "success.txt"), "w") as f:

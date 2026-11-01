@@ -566,6 +566,16 @@ def main():
         print(f"[sn56] Treino FALHOU", flush=True)
     else:
         print(f"[sn56] Treino finalizado com sucesso", flush=True)
+        if args.task_type == TaskType.INSTRUCTTEXTTASK.value:
+            # SN56_LR_RETRY (default off): dev-selected second run at the search
+            # argmin when this run stopped early with budget left (sn56_retry.py).
+            try:
+                from sn56_retry import maybe_second_run
+                maybe_second_run(train_cmd, log_path, run_output_dir, request_path, submission_dir,
+                                 run_cmd_with_log, replace_args_in_cmd,
+                                 log=lambda m: print(m, flush=True))
+            except Exception as _e:
+                print(f"[sn56][lr2] falhou ({_e!r}), mantendo a 1a corrida", flush=True)
 
     if not os.path.exists(submission_dir) or len(os.listdir(submission_dir)) < 2:
         print(f"Training failed for task {args.task_id}", flush=True)

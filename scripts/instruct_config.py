@@ -12,6 +12,7 @@ from lr_finder import estimate_starting_lr
 from adaptive_max_length import compute_max_length
 from v5_lane import is_v5_lane, launcher
 from sn56_plan import v5_pack_setting
+import sn56_plan
 
 
 FIXED_BS_CONFIG = {
@@ -366,11 +367,18 @@ def get_training_json(train_info: dict) -> dict:
             # this the GA computed above stays pinned to the pre-rescale batch
             # and the effective batch silently drops below the 64 target
             # (e.g. bs 100 -> 25 with GA still 1 = effective 25).
-            data_per_step = run_config["batch_size"] * run_config["gpu_nums"]
-            if data_per_step >= 64:
-                run_config["gradient_accumulation_steps"] = 1
-            else:
-                run_config["gradient_accumulation_steps"] = -(-64 // data_per_step)
+            # SN56_GA_RESCALE=0 keeps the pinned GA (champion rule) for packed
+            # InstructText: the packer floor scales with GA, so the re-derived GA left
+            # a long-prompt R2 task at <=2 rows per 4096 pack (30% full), ~half the epochs per
+            # hour. ChatTask (8192, GA 8 -> 1 would be an 8x smaller batch) is unmeasured.
+            _keep_ga = (not sn56_plan.flag_on("SN56_GA_RESCALE") and packing_enabled
+                        and train_info.get("task_type", "InstructTextTask") == "InstructTextTask")
+            if not _keep_ga:
+                data_per_step = run_config["batch_size"] * run_config["gpu_nums"]
+                if data_per_step >= 64:
+                    run_config["gradient_accumulation_steps"] = 1
+                else:
+                    run_config["gradient_accumulation_steps"] = -(-64 // data_per_step)
             print(
                 f"[instruct_config] max_length {default_max} -> {max_length}, "
                 f"batch_size {old_bs} -> {run_config['batch_size']}, "
@@ -409,6 +417,20 @@ def get_training_json(train_info: dict) -> dict:
             flush=True,
         )
 
+    # SN56_BATCH_DIV (default 1 = off): smaller effective batch for InstructText full FT, same LR. 31 Oct R2 replay:
+    # the leader reaches ~1 epoch in ~500 steps of ~34 rows, we ran ~244 steps of ~69 rows per epoch; at a fixed token
+    # budget smaller batches reach lower held-out NLL (Post-Training Science for SFT, arXiv 2609.01244, Sep 2026).
+    # SN56_R1_SMALLBATCH: divisor 3 + min_steps x3 for the 1B-4B R1 sizes; bloomz-560m got worse with it (1 Nov).
+    from sn56_plan import batch_div
+    _r1sb = (3.0 if sn56_plan.flag_on("SN56_R1_SMALLBATCH") and 1_000_000_000 <= param_nums < 4_000_000_000
+             else 1.0)
+    if train_info.get("task_type", "InstructTextTask") == "InstructTextTask" and not run_config["use_lora"]:
+        _ga, _bs = batch_div(run_config["gradient_accumulation_steps"], run_config["batch_size"], _r1sb)
+        if (_ga, _bs) != (run_config["gradient_accumulation_steps"], run_config["batch_size"]):
+            print(f"[sn56][batch] SN56_BATCH_DIV: grad_accum {run_config['gradient_accumulation_steps']} -> {_ga}, "
+                  f"batch_size {run_config['batch_size']} -> {_bs}", flush=True)
+            run_config["gradient_accumulation_steps"], run_config["batch_size"] = _ga, _bs
+
     run_config["learning_rate"] *= train_info["reg_ratio"]
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
     train_request = deepcopy(train_info)
@@ -429,5 +451,20 @@ def get_training_json(train_info: dict) -> dict:
         train_request["min_steps"] = max(
             int(train_info["hours_to_complete"] * 70), train_request["min_steps"]
         )
+
+    # SN56_MIN_STEPS_MULT (default 1 = off): min_steps is the packer's floor on steps per epoch (monkeypatch
+    # pack_with_min_item_num), so a smaller batch only gives more, smaller steps when this floor rises with it.
+    _msm = max(sn56_plan.flag_float("SN56_MIN_STEPS_MULT"), _r1sb)
+    if (_msm > 1 and train_info.get("task_type", "InstructTextTask") == "InstructTextTask"
+            and not run_config["use_lora"] and train_request.get("min_steps")):
+        print(f"[sn56][batch] SN56_MIN_STEPS_MULT: min_steps {train_request['min_steps']} -> "
+              f"{int(train_request['min_steps'] * _msm)}", flush=True)
+        train_request["min_steps"] = int(train_request["min_steps"] * _msm)
+
+    # Record the actual resolved full-FT scope before tokenization. No change
+    # to the serialized request when the feature is off.
+    from sn56_dev_testlike import enabled
+    if enabled(train_info.get("task_type", "InstructTextTask"), run_config["use_lora"]):
+        train_request["dev_testlike"] = True
 
     return {"train_request": train_request, "run_cmd": run_cmd}

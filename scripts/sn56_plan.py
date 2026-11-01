@@ -15,7 +15,78 @@ the inherited code path for A/B:
                                             estimate when the search is off
   SN56_NEFTUNE            0        1     F4 NEFTune noise on the embeddings
   SN56_V5_PACK            auto     0     F5 v5-lane throughput mode (auto|0|1)
-  SN56_PER_EXAMPLE_LOSS   0        0     F6 evaluator-native per-example loss (A/B)
+  SN56_PER_EXAMPLE_LOSS   1        0     F6 evaluator-native per-example loss (K1-b, see below)
+  SN56_PER_EXAMPLE_ALPHA  0.5      1.0   K1-b F6 weight n_i^-alpha (1 = per-example mean,
+                                            0 = token mean; sn56_loss.py)
+  SN56_DEV_TESTLIKE       0        0     row-random dev after exact dedup (InstructText full FT)
+  SN56_DEV_METRIC         vali     stock K1-a dev metric: stock | vali (the validator's
+                                            per-example mean + KL term; sn56_devmetric.py)
+  SN56_GAIN               0        0     K4 fp32 per-tensor gains on eligible weights (sn56_gain.py)
+  SN56_GAIN_LR            0.01     0.01  K4 gain learning rate
+  SN56_SCALE_REPAIR       1        0     K4-repair: blind lattice detection of the validator's
+                                            weight_scaling, undone at load (sn56_scale_detect.py)
+  SN56_K1_CHAT            1        0     F6 + K4-repair also on ChatTask full fine-tunes (same
+                                            instruct evaluator; continuous-SFT boss task)
+  SN56_DPO_SELECT         mean     mean  K5 DPO checkpoint selection: mean | gate (paired-gate
+                                            bound vs the base proxy; sn56_dpo_select.py)
+  SN56_GRPO_EXPO          1        0     GRPO post-training weight extrapolation, dev-selected
+                                            (grpo_expo.py; beat the champion code 3/3 seeds, 25 Sep)
+  SN56_LR_RETRY           1        0     dev-selected second InstructText run at the LR search's
+                                            argmin when the first run stopped early with budget
+                                            left (sn56_retry.py; text_trainer.py). Default since
+                                            30 Oct: 26 Oct R1 granite 9th -> 7th (dev 1.91175 -> 1.90274)
+  SN56_LOGIT_CAL          0        0     final logit-scale calibration on dev, folded into the
+                                            final norm / lm_head (sn56_logit_cal.py); off: the dev
+                                            gain did not reach the test set (30 Oct, bloomz / SmolLM)
+  SN56_GA_RESCALE         1        1     re-derive grad accumulation after the max_length rescale
+                                            (83ed96f); 0 = keep the pre-rescale GA like the champion
+                                            tree, packed InstructText only (dense packing on long-prompt
+                                            tasks; instruct_config.py)
+  SN56_R1_COOLDOWN        1        0     the second run cools over ~1.25x the first run's best-dev
+                                            epoch (min_lr_rate 0.1, evals from 0.25 epoch); also
+                                            retries at the same LR when the argmin is not lower.
+                                            Default since 1 Nov, together with SN56_R1_AVG2
+  SN56_R1_AVG2            1        0     the second run also tries the 50:50 average with the first
+                                            run's pre-dev-pass weights (kept only if dev improves);
+                                            both on: 26 Oct granite 1.88100 -> 1.87755, 19 Oct
+                                            Llama-1B 0.68582 -> 0.68400 (one seed each)
+  SN56_F6_GLOBAL          0        0     F6 denominator summed over DDP ranks (global per-example
+                                            normalisation; one GPU unchanged) (sn56_loss.py)
+  SN56_DEV_SCOREABLE      1        0     dev rows the validator would drop (> its eval sequence_len)
+                                            are dropped from dev, not truncated (K1-a parity)
+  SN56_CHAT_EVAL          0        0     ChatTask full FT gets the InstructText plan (F1 evals,
+                                            F2 time plan + tail, F3 search, F4, guards): the inherited
+                                            Chat path skipped every eval in a 0.75 h smoke (no_eval)
+  SN56_SOUP_CGROUP        1        0     soup snapshot RAM bound also respects the container's
+                                            cgroup memory limit (never admits more, only fewer)
+  SN56_TRAIN_SCOREABLE    0        0     ChatTask: training max_length capped at the validator's eval
+                                            sequence_len (4096): >4096 rows are 11% of the 26 Oct Chat rows
+                                            but ~53% of the tokens trained at 8192
+  SN56_FP32_NORMS         0        0     fp32 master copies for 1-D parameters (norm weights,
+                                            biases): small updates accumulate instead of rounding
+                                            away in bf16 (sn56_fp32_master.py)
+  SN56_BATCH_DIV          1        1     InstructText full FT: divide the effective batch (gradient
+                                            accumulation first, then the per-device batch), same LR
+                                            (instruct_config.py; 31 Oct: ~69 rows/step vs the leader's ~34)
+  SN56_PLW                1        1     prompt-loss weighting on prompt-dominated data (> 5:1);
+                                            0 = completion-only loss, the scored quantity (train_instruct.py)
+  SN56_MIN_STEPS_MULT     1        1     InstructText full FT: multiply the request's min_steps, which the
+                                            packer turns into a floor on optimizer steps per epoch; with
+                                            SN56_BATCH_DIV it is what actually shrinks rows per step (31 Oct:
+                                            BATCH_DIV alone re-packed to ~130 rows/step, 127 steps/epoch)
+  SN56_R1_SMALLBATCH      1        0     1B-4B InstructText full FT (the R1 sizes): BATCH_DIV 3 + MIN_STEPS_MULT 3
+                                            (~3x more optimizer steps per epoch; a larger explicit value of either
+                                            flag still wins). 1 Nov, 26 Oct / 19 Oct R1 tasks, one seed unless noted:
+                                            Llama-1B 0.68400 -> 0.67675 / 0.67838 (2 seeds), SmolLM-1.7B 1.16843 ->
+                                            1.16331 (same-run control), granite-3B 1.87755 -> 1.87642; bloomz-560m
+                                            1.56857 -> 1.58993 (worse, hence the 1B floor)
+
+K1 / K4-repair defaults (measured 29 Oct, H100, one seed each, replayed 19 Oct tasks):
+F6 alpha=0.5 + the vali dev metric took a MiniCPM task 1.29127 -> 1.27917 (8th -> 3rd of 14)
+and a weight-scaled Qwen2.5 task 0.72634 -> 0.70639; alpha=1 was worse on both (1.30902,
+0.74879). K4-repair alone took the Qwen2.5 task to 0.72233. ChatTask is not measured: it is
+scored by the same per-example evaluator, so SN56_K1_CHAT extends F6 + K4-repair to
+it; SN56_K1_CHAT=0 keeps the inherited Chat loss.
 
 SN56_TEXT_FIX=0 is a master switch: every flag above takes its old value.
 
@@ -40,6 +111,7 @@ _FALSY = ("0", "false", "no", "off")
 
 # name -> (default, old value). The old value is what SN56_TEXT_FIX=0 forces.
 FLAGS = {
+    "SN56_DEV_TESTLIKE": ("0", "0"),
     "SN56_EVAL_SKIP_FIX": ("1", "0"),
     "SN56_TIME_PLAN": ("1", "0"),
     "SN56_MAX_EPOCHS": ("4", "4"),
@@ -47,7 +119,30 @@ FLAGS = {
     "SN56_LR_MULT": ("1.0", "1.0"),
     "SN56_NEFTUNE": ("0", "1"),
     "SN56_V5_PACK": ("auto", "0"),
-    "SN56_PER_EXAMPLE_LOSS": ("0", "0"),
+    "SN56_PER_EXAMPLE_LOSS": ("1", "0"),
+    "SN56_PER_EXAMPLE_ALPHA": ("0.5", "1.0"),
+    "SN56_DEV_METRIC": ("vali", "stock"),
+    "SN56_GAIN": ("0", "0"),
+    "SN56_GAIN_LR": ("0.01", "0.01"),
+    "SN56_SCALE_REPAIR": ("1", "0"),
+    "SN56_K1_CHAT": ("1", "0"),
+    "SN56_DPO_SELECT": ("mean", "mean"),
+    "SN56_GRPO_EXPO": ("1", "0"),
+    "SN56_LR_RETRY": ("1", "0"),
+    "SN56_LOGIT_CAL": ("0", "0"),
+    "SN56_GA_RESCALE": ("1", "1"),
+    "SN56_R1_COOLDOWN": ("1", "0"),
+    "SN56_R1_AVG2": ("1", "0"),
+    "SN56_F6_GLOBAL": ("0", "0"),
+    "SN56_DEV_SCOREABLE": ("1", "0"),
+    "SN56_CHAT_EVAL": ("0", "0"),
+    "SN56_SOUP_CGROUP": ("1", "0"),
+    "SN56_FP32_NORMS": ("0", "0"),
+    "SN56_BATCH_DIV": ("1", "1"),
+    "SN56_PLW": ("1", "1"),
+    "SN56_MIN_STEPS_MULT": ("1", "1"),
+    "SN56_R1_SMALLBATCH": ("1", "0"),
+    "SN56_TRAIN_SCOREABLE": ("0", "0"),
 }
 MASTER = "SN56_TEXT_FIX"
 
@@ -105,6 +200,124 @@ def flags_summary() -> str:
         parts.append(f"TEXT_FIX={master}")
     return ",".join(parts)
 
+
+
+
+def batch_div(grad_accum: int, batch_size: int, floor_div: float = 1.0) -> tuple:
+    """SN56_BATCH_DIV: (gradient_accumulation_steps, per-device batch) for an effective batch divided by the flag
+    (at least floor_div, the SN56_R1_SMALLBATCH divisor); accumulation shrinks first, the per-device batch only when
+    accumulation is already 1. Off (<= 1): unchanged."""
+    d = max(flag_float("SN56_BATCH_DIV"), floor_div)
+    if not d > 1:
+        return grad_accum, batch_size
+    target = max(1, round(grad_accum * batch_size / d))
+    ga = max(1, min(grad_accum, round(grad_accum / d)))
+    return ga, max(1, min(batch_size, round(target / ga)))
+
+
+def env_pos_float(name: str) -> Optional[float]:
+    """A positive finite float from a raw env var (second-run plumbing set by sn56_retry, not FLAGS)."""
+    try:
+        v = float(os.environ.get(name, "").strip())
+    except ValueError:
+        return None
+    return v if v > 0 and math.isfinite(v) else None
+
+
+def lr_fixed() -> Optional[float]:
+    """SN56_LR_FIXED: the absolute LR of the dev-selected second run (set by sn56_retry, never by hand)."""
+    raw = os.environ.get("SN56_LR_FIXED", "").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        return None
+    return v if v > 0 and math.isfinite(v) else None
+
+
+def cgroup_free_bytes(root: str = "/sys/fs/cgroup") -> Optional[int]:
+    """limit - usage of this container's memory cgroup (v2 memory.max/current, v1
+    memory.limit_in_bytes/usage_in_bytes); None when unlimited or unreadable."""
+    for lim_f, use_f in (("memory.max", "memory.current"),
+                         ("memory/memory.limit_in_bytes", "memory/memory.usage_in_bytes")):
+        try:
+            with open(os.path.join(root, lim_f)) as f:
+                lim = f.read().strip()
+            with open(os.path.join(root, use_f)) as f:
+                use = int(f.read().strip())
+        except (OSError, ValueError):
+            continue
+        if lim == "max":
+            return None
+        try:
+            lim_i = int(lim)
+        except ValueError:
+            return None
+        if lim_i >= (1 << 60):      # v1 "unlimited" sentinel
+            return None
+        return max(0, lim_i - use)
+    return None
+
+
+def best_step_from_loss_txt(submission_dir: str) -> Optional[int]:
+    """The best checkpoint step the trainer wrote into loss.txt ("<step>,<dev loss>"), else None."""
+    try:
+        with open(os.path.join(submission_dir, "loss.txt")) as f:
+            head = f.readline().strip().split(",")[0]
+        return int(head)
+    except (OSError, ValueError):
+        return None
+
+
+RUN_RECORD = "sn56_run.json"
+
+
+def write_run_record(output_dir: str, rec: dict) -> None:
+    """Atomic JSON write of the run record (train_instruct, before the dev-pass)."""
+    import json
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, RUN_RECORD)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(rec, f)
+    os.replace(tmp, path)
+
+
+def read_run_record(output_dir: str) -> Optional[dict]:
+    import json
+    try:
+        with open(os.path.join(output_dir, RUN_RECORD)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def sft_features(task_type: str, use_lora: bool, deepspeed, use_kl: bool) -> dict:
+    """Which SN56 behaviours a train_instruct run gets (pure; train_instruct.main uses it).
+
+    sn56_on : the InstructText full-FT fixes F1-F4 + K4 gains (ChatTask only with
+              SN56_CHAT_EVAL; LoRA and DeepSpeed keep every inherited behaviour there)
+    sft_full: InstructText full FT, plus ChatTask full FT when SN56_K1_CHAT is on;
+              F6 (K1-b) and K4-repair run on it (never with KL: the KL reference is the
+              augmented base, and F6 has no KL term)
+    dev_vali: K1-a validator dev metric, metric-only, any InstructText / ChatTask run
+    logit_cal: final logit-scale calibration on dev (sft_full, no KL; single process, train_instruct)
+    """
+    full = not use_lora and deepspeed is None
+    sn56_on = full and (task_type == "InstructTextTask"
+                        or (task_type == "ChatTask" and flag_on("SN56_CHAT_EVAL")))
+    sft_full = full and (task_type == "InstructTextTask"
+                         or (task_type == "ChatTask" and flag_on("SN56_K1_CHAT")))
+    return {
+        "sn56_on": sn56_on,
+        "sft_full": sft_full,
+        "per_example": sft_full and flag_on("SN56_PER_EXAMPLE_LOSS") and not use_kl,
+        "alpha": flag_float("SN56_PER_EXAMPLE_ALPHA"),
+        "dev_vali": task_type in ("InstructTextTask", "ChatTask") and flag_str("SN56_DEV_METRIC") == "vali",
+        "gain": sn56_on and flag_on("SN56_GAIN"),
+        "scale_repair": sft_full and flag_on("SN56_SCALE_REPAIR") and not use_kl,
+        "logit_cal": sft_full and flag_on("SN56_LOGIT_CAL") and not use_kl,
+        "fp32_norms": sft_full and flag_on("SN56_FP32_NORMS"),
+    }
 
 # ── F1: eval-skip threshold ──────────────────────────────────────────────────
 

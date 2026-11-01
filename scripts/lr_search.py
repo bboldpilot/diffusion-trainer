@@ -282,6 +282,12 @@ def plan_budget(
     return _sweep_or_skip(">=2 epochs but tight")
 
 
+# The last search's deepest populated tier {log10(lr): loss} and its argmin LR (linear), for the
+# dev-selected second run (sn56_retry.py, SN56_LR_RETRY); empty / None when the search had no pool.
+LAST_POOL: dict = {}
+LAST_ARGMIN = None
+
+
 def select_edge_lr(
     scores: dict[float, float], tolerance: float = _EDGE_TOLERANCE
 ) -> tuple[float, float]:
@@ -1041,6 +1047,9 @@ def run_lr_search(
 
     # ── Selection: edge rule within the deepest populated tier. ──
     pool = full_scores if full_scores else s1_scores
+    global LAST_POOL, LAST_ARGMIN
+    LAST_POOL = dict(pool) if pool else {}
+    LAST_ARGMIN = 10 ** min(pool, key=pool.get) if pool else None
     if not pool:
         # Nothing survived (all pruned, or OOM cleared then exhausted): fall back
         # to the current (possibly rescaled) centre estimate.

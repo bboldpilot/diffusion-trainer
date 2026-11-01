@@ -458,6 +458,13 @@ def main():
     t2 = datetime.datetime.now()
     log_info(f"truncagem concluída em {(t2 - t1).seconds}s")
 
+    # [sn56] SN56_GRPO_EVAL_CAP (default off): trainer evals on the first N dev prompts (grpo_expo.eval_cap)
+    from grpo_expo import eval_cap
+    _cap = eval_cap(len(dev_ds))
+    if _cap < len(dev_ds):
+        log_info(f"[sn56][expo] eval cap: {len(dev_ds)} -> {_cap} dev prompts")
+        dev_ds = dev_ds.select(range(_cap))
+
     max_steps = train_request.get("max_steps", -1)
     log_info(f"teto de passos={max_steps}")
 
@@ -493,6 +500,21 @@ def main():
     log_info(f"Bora treinar")
     trainer.train()
     log_info(f"Treino finalizado")
+
+    # ── [sn56][expo] post-hoc extrapolation away from the base, dev-selected (SN56_GRPO_EXPO, default on) ──
+    import sn56_plan
+    if sn56_plan.flag_on("SN56_GRPO_EXPO") and is_main_process(LOCAL_RANK):
+        try:
+            from grpo_expo import run_expo
+            _rf = []
+            for _r in train_request["dataset_type"]["reward_functions"]:
+                _ok, _err, _fn = validate_reward_function(_r["reward_func"], None)
+                if not _ok:
+                    raise ValueError(_err)
+                _rf.append((_fn, float(_r["reward_weight"])))
+            run_expo(train_request, _rf, log=log_info)
+        except Exception as _e:
+            log_info(f"[sn56][expo] falhou ({_e!r}), mantendo submissão")
 
     if is_main_process(LOCAL_RANK):
         with open(os.path.join(training_args.output_dir, "success.txt"), "w") as f:

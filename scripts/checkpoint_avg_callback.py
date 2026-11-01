@@ -185,21 +185,34 @@ class AdaptiveTrainingCallback(TrainerCallback):
 
     @staticmethod
     def _available_ram_bytes() -> Optional[int]:
-        """Free host RAM in bytes (psutil if present, else /proc/meminfo). None
-        if neither is readable — callers then stay conservative."""
+        """Free RAM in bytes (psutil if present, else /proc/meminfo), capped by the
+        container's cgroup headroom (SN56_SOUP_CGROUP, sn56_plan.cgroup_free_bytes):
+        host MemAvailable ignores a docker --memory limit. None if nothing is
+        readable — callers then stay conservative."""
+        host = None
         try:
             import psutil
-            return int(psutil.virtual_memory().available)
+            host = int(psutil.virtual_memory().available)
         except Exception:
             pass
+        if host is None:
+            try:
+                with open("/proc/meminfo") as f:
+                    for line in f:
+                        if line.startswith("MemAvailable:"):
+                            host = int(line.split()[1]) * 1024
+                            break
+            except Exception:
+                pass
         try:
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    if line.startswith("MemAvailable:"):
-                        return int(line.split()[1]) * 1024
+            import sn56_plan
+            if sn56_plan.flag_on("SN56_SOUP_CGROUP"):
+                cg = sn56_plan.cgroup_free_bytes()
+                if cg is not None:
+                    host = cg if host is None else min(host, cg)
         except Exception:
             pass
-        return None
+        return host
 
     def _can_admit_snapshot(self, model) -> bool:
         """True only if a new CPU snapshot fits with headroom. A snapshot costs

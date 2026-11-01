@@ -28,7 +28,9 @@ def test_flags_defaults_old_values_and_master():
     assert P.flag_on("SN56_EVAL_SKIP_FIX") and P.flag_on("SN56_TIME_PLAN")
     # F3 (measured 21-25 Sep): the search is on by default; LR_MULT scales its pick
     assert P.flag_on("SN56_LR_SEARCH") and not P.flag_on("SN56_NEFTUNE")
-    assert not P.flag_on("SN56_PER_EXAMPLE_LOSS")
+    # K1 / K4-repair / GRPO expo defaults since 30 Oct (test_sn56_defaults.py has the matrix)
+    assert P.flag_on("SN56_PER_EXAMPLE_LOSS") and P.flag_float("SN56_PER_EXAMPLE_ALPHA") == 0.5
+    assert P.flag_str("SN56_DEV_METRIC") == "vali" and P.flag_on("SN56_SCALE_REPAIR") and P.flag_on("SN56_GRPO_EXPO")
     assert P.v5_pack_setting() == "auto" and P.max_epochs() == 4.0 and P.flag_float("SN56_LR_MULT") == 1.0
     # one env var per flag restores the inherited path / the A/B arm
     os.environ["SN56_LR_SEARCH"] = "0"
@@ -48,6 +50,8 @@ def test_flags_defaults_old_values_and_master():
     assert not P.flag_on("SN56_EVAL_SKIP_FIX") and not P.flag_on("SN56_TIME_PLAN")
     assert P.flag_on("SN56_LR_SEARCH") and P.flag_on("SN56_NEFTUNE")
     assert P.v5_pack_setting() == "0" and not P.flag_on("SN56_PER_EXAMPLE_LOSS")
+    assert P.flag_float("SN56_PER_EXAMPLE_ALPHA") == 1.0 and P.flag_str("SN56_DEV_METRIC") == "stock"
+    assert not P.flag_on("SN56_SCALE_REPAIR") and not P.flag_on("SN56_GRPO_EXPO") and not P.flag_on("SN56_K1_CHAT")
     assert "TEXT_FIX=0" in P.flags_summary()
     _clear_env()
     print("[ok] flags: defaults = new behaviour, per-flag and master rollback")

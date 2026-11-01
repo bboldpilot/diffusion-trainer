@@ -199,7 +199,17 @@ def get_max_length_config():
 def main():
     """Format of training requests"""
     argument_parser = transformers.HfArgumentParser((TrainingArguments, LoraArguments))
+    _t_main0 = time.time()
     (training_args, lora_args) = argument_parser.parse_args_into_dataclasses()
+    # SN56_SEED (rehearsal replicates only; the validator passes no env, so the
+    # inherited TrainingArguments seed 42 is what ships): data order + init seed.
+    _seed_env = os.environ.get("SN56_SEED", "").strip()
+    if _seed_env.lstrip("-").isdigit():
+        training_args.seed = int(_seed_env)
+    # SN56_MIN_LR_RATE (second run of SN56_R1_COOLDOWN, set by sn56_retry): cosine floor.
+    _min_lr_rate_env = sn56_plan.env_pos_float("SN56_MIN_LR_RATE")
+    if _min_lr_rate_env is not None and _min_lr_rate_env < 1:
+        training_args.lr_scheduler_kwargs = {"min_lr_rate": _min_lr_rate_env}
     train_info = json.load(open(training_args.request_path, "r"))
     train_request = train_info["train_request"]
     # log_info(f"Training request: {train_request}", "start")
@@ -224,19 +234,29 @@ def main():
         log_info(f"[sn56][kl] USE_KL=1, kl_coef={kl_coef} — termo KL ativo")
 
     # ── SN56_* fixes (flags + math in sn56_plan.py) ──
-    # InstructText full fine-tune only: ChatTask (same script), LoRA and
-    # DeepSpeed runs keep every inherited behaviour whatever the env says.
+    # F1-F4 + K4 gains: InstructText full fine-tune only; ChatTask (same
+    # script), LoRA and DeepSpeed runs keep those inherited behaviours.
+    # F6 (K1-b) + K4-repair: InstructText and ChatTask full fine-tunes
+    # (SN56_K1_CHAT); K1-a dev metric: any InstructText / ChatTask run.
     _task_type = train_request.get("task_type", "InstructTextTask")
-    _sn56_on = (
-        _task_type == "InstructTextTask"
-        and not training_args.use_lora
-        and getattr(training_args, "deepspeed", None) is None
-    )
+    _feat = sn56_plan.sft_features(_task_type, training_args.use_lora,
+                                   getattr(training_args, "deepspeed", None), use_kl)
+    _sn56_on = _feat["sn56_on"]
     _f_eval_fix = _sn56_on and sn56_plan.flag_on("SN56_EVAL_SKIP_FIX")
     _f_time_plan = _sn56_on and sn56_plan.flag_on("SN56_TIME_PLAN")
     _f_lr_search = (not _sn56_on) or sn56_plan.flag_on("SN56_LR_SEARCH")
     _f_neftune = (not _sn56_on) or sn56_plan.flag_on("SN56_NEFTUNE")
-    _f_per_example = _sn56_on and sn56_plan.flag_on("SN56_PER_EXAMPLE_LOSS") and not use_kl
+    _f_per_example = _feat["per_example"]
+    _f6_alpha = _feat["alpha"]
+    # K1-a: the validator's own dev metric (sn56_devmetric.py). Metric-only.
+    _f_dev_vali = _feat["dev_vali"]
+    # K4: fp32 per-tensor gains on augmentation-eligible weights (sn56_gain.py).
+    _f_gain = _feat["gain"]
+    # K4-repair: undo the validator's weight_scaling at load, blind (sn56_scale_detect.py). Not on KL
+    # tasks: their KL reference is the augmented base.
+    _f_scale_repair = _feat["scale_repair"]
+    log_info(f"[sn56][k1] tarefa={_task_type} f6={_f_per_example} alpha={_f6_alpha:g} "
+             f"dev={'vali' if _f_dev_vali else 'stock'} reparo={_f_scale_repair} ganho={_f_gain}")
     # F5: instruct_config decided the v5-lane mode (v5_pack.py); follow it.
     _v5_mode = train_request.get("packing_mode") if train_request.get("packing_mode") in ("v5_fa2", "v5_dyn") else None
 
@@ -291,6 +311,20 @@ def main():
     max_length = get_max_length_config()
     if "max_length" in train_request:
         max_length = train_request["max_length"]
+    if _task_type == "ChatTask" and sn56_plan.flag_on("SN56_TRAIN_SCOREABLE"):
+        # SN56_TRAIN_SCOREABLE: the validator scores only conversations <= its eval
+        # sequence_len (4096); on the 26 Oct Chat data rows > 4096 are 11% of rows but
+        # ~53% of the tokens trained at max_length 8192. Cap training at that length
+        # (longer rows are truncated, not dropped) so the time goes to scored lengths.
+        try:
+            from sn56_devmetric import vali_sequence_len
+            with open(os.path.join(train_request["model_path"], "config.json")) as _cf:
+                _vseq_t = vali_sequence_len(json.load(_cf).get("max_position_embeddings"))
+            if max_length > _vseq_t:
+                log_info(f"[sn56][chatlen] max_length {max_length} -> {_vseq_t} (SN56_TRAIN_SCOREABLE)")
+                max_length = _vseq_t
+        except Exception as _e:
+            log_info(f"[sn56][chatlen] falhou ({_e!r}), max_length {max_length}")
 
     # we already tokenize the data and save it to .pt (torch format, fast)
     _DatasetCls = MyDataset
@@ -310,6 +344,24 @@ def main():
         max_length
     )
     log_info(f"treino={len(train_ds)}, teste={len(dev_ds)}")
+    if _f_dev_vali and sn56_plan.flag_on("SN56_DEV_SCOREABLE") and hasattr(dev_ds, "eval_dataset"):
+        # K1-a parity: the validator drops eval rows longer than its sequence_len
+        # (4096, or ceil(mpe/2) for short-context models) and scores the rest whole.
+        try:
+            from sn56_devmetric import scoreable_rows, vali_sequence_len
+            with open(os.path.join(train_request["model_path"], "config.json")) as _cf:
+                _mpe = json.load(_cf).get("max_position_embeddings")
+            _vseq = vali_sequence_len(_mpe)
+            dev_ds.eval_dataset, _n_drop = scoreable_rows(dev_ds.eval_dataset, _vseq)
+            log_info(f"[sn56][devmetric] linhas do dev acima de {_vseq} (seq do validador, mpe={_mpe}): "
+                     f"{_n_drop} removidas, {len(dev_ds.eval_dataset)} ficam")
+        except Exception as _e:
+            log_info(f"[sn56][devmetric] filtro de comprimento falhou ({_e!r}), dev intacto")
+    if _f_dev_vali:
+        _dev_long = sum(1 for dp in getattr(dev_ds, "eval_dataset", [])
+                        if len(dp.get("input_ids", [])) > max_length)
+        log_info(f"[sn56][devmetric] SN56_DEV_METRIC=vali: {len(dev_ds)} exemplos no dev, "
+                 f"{_dev_long} > max_length {max_length} (truncados aqui; o validador pontua inteiros até 4096)")
 
     # ── Training data deduplication ──
     # Removes exact-duplicate tokenized samples. Especially impactful for
@@ -318,7 +370,11 @@ def main():
     near_dup_rate = 0.0
     if baseline_stats:
         near_dup_rate = baseline_stats.get("dataset", {}).get("near_duplicate_rate", 0.0)
-    if near_dup_rate > 0.2:
+    from sn56_dev_testlike import training_dedup_enabled
+    # The request records the split actually used, including on LR/OOM retries.
+    _dev_testlike = (_task_type == "InstructTextTask" and not training_args.use_lora
+                     and train_request.get("dev_testlike", False))
+    if training_dedup_enabled(near_dup_rate, _dev_testlike):
         from data_filter import deduplicate_samples
         before = len(train_ds.eval_dataset)
         train_ds.eval_dataset = deduplicate_samples(train_ds.eval_dataset)
@@ -334,7 +390,9 @@ def main():
         _prompt_tok = _ds.get("prompt_tokens", 0)
         _comp_tok = _ds.get("completion_tokens", 1)
         _pc_ratio = _prompt_tok / max(_comp_tok, 1)
-        if _pc_ratio > 5:
+        if _pc_ratio > 5 and not sn56_plan.flag_on("SN56_PLW"):
+            log_info(f"[sn56][plw] prompt:comp={_pc_ratio:.1f}:1, off (SN56_PLW=0: completion-only loss)")
+        elif _pc_ratio > 5:
             _plw = 0.05 / max(1.0, _pc_ratio / 5.0)
             from utility import apply_prompt_loss_weight
             train_ds.eval_dataset = apply_prompt_loss_weight(train_ds.eval_dataset, plw=_plw)
@@ -460,6 +518,10 @@ def main():
         model = load_model(training_args, train_request["model_path"], len(tokenizer))
         # some model need to resize the token embeddings or encounter the size mismatch error; only for full-weight models
         resize_if_needed(train_request["model_name"], model, len(tokenizer))
+        if _f_scale_repair:
+            # before the LR search, so every later decision sees the repaired base
+            from sn56_scale_detect import repair_model
+            repair_model(model, train_request["model_path"], log=log_info)
     
     try:
         model.config.use_cache = False
@@ -609,10 +671,44 @@ def main():
     _trainer_cls = KLRegularizedTrainer if use_kl else Trainer
     if _f_per_example:
         # F6 (SN56_PER_EXAMPLE_LOSS=1): mean over examples of per-token CE,
-        # the validator's test_loss weighting (sn56_loss.py).
+        # the validator's test_loss weighting (sn56_loss.py); K1-b alpha != 1
+        # weights example i by n_i^-alpha instead.
         from sn56_loss import make_per_example_trainer
-        _trainer_cls = make_per_example_trainer(_trainer_cls)
-        log_info("[sn56][perda] média por exemplo (SN56_PER_EXAMPLE_LOSS=1)")
+        _trainer_cls = make_per_example_trainer(_trainer_cls, alpha=_f6_alpha,
+                                                global_norm=sn56_plan.flag_on("SN56_F6_GLOBAL"))
+        log_info(f"[sn56][perda] média por exemplo (SN56_PER_EXAMPLE_LOSS=1, alpha={_f6_alpha:g})")
+    if _feat["fp32_norms"]:
+        # SN56_FP32_NORMS: fp32 masters for norm weights / biases (sn56_fp32_master.py)
+        from sn56_fp32_master import make_fp32_norm_trainer
+        _trainer_cls = make_fp32_norm_trainer(_trainer_cls)
+        log_info("[sn56][fp32] mestres fp32 para parametros 1-D (SN56_FP32_NORMS=1)")
+    _gain_cb = None
+    if _f_gain:
+        # K4 (SN56_GAIN=1): gains trained in their own optimizer group, folded
+        # into the weights before every eval/save and at train end (sn56_gain.py).
+        # SN56_GAIN_INIT=<json {param name: g0}> sets initial gains (default 1.0).
+        from sn56_gain import GainCallback, make_gain_trainer
+        _gain_init = {}
+        _gain_init_path = os.environ.get("SN56_GAIN_INIT", "").strip()
+        if _gain_init_path:
+            try:
+                with open(_gain_init_path) as _f:
+                    _gain_init = {str(k): float(v) for k, v in json.load(_f).items()}
+            except Exception as _e:
+                log_info(f"[sn56][ganho] SN56_GAIN_INIT ilegível ({_e}), ganhos em 1.0")
+                _gain_init = {}
+        _trainer_cls = make_gain_trainer(_trainer_cls, gain_lr=sn56_plan.flag_float("SN56_GAIN_LR"),
+                                         init=_gain_init)
+        _gain_cb = GainCallback()
+        log_info(f"[sn56][ganho] SN56_GAIN=1 lr={sn56_plan.flag_float('SN56_GAIN_LR'):g} "
+                 f"init={len(_gain_init)} valores")
+    if _f_dev_vali:
+        # K1-a (SN56_DEV_METRIC=vali): eval_loss = the validator's metric, so the
+        # best checkpoint, soup, early stop and loss.txt select on it.
+        from sn56_devmetric import make_vali_dev_trainer
+        _trainer_cls = make_vali_dev_trainer(_trainer_cls, kl_coef=kl_coef if use_kl else 0.0)
+        log_info(f"[sn56][devmetric] eval_loss = média por exemplo"
+                 f"{f' + {kl_coef:g} x KL' if use_kl else ''} (SN56_DEV_METRIC=vali)")
     # Kept as a variable: the dev-pass budgeting below moves its end-time
     # trigger earlier once t_per_step is known (the trigger now also STOPS
     # training — see CustomEvalSaveCallback — which is what gives the dev-pass
@@ -643,6 +739,8 @@ def main():
         train_dataset=train_ds,
         eval_dataset=dev_ds,
         callbacks=[
+            # K4 fold + unhook must precede the checkpoint callbacks' train end
+            *([] if _gain_cb is None else [_gain_cb]),
             *([] if ckpt_avg is None else [ckpt_avg]),
             _eval_cb,
         ],
@@ -653,6 +751,8 @@ def main():
         _trainer_kwargs["kl_coef"] = kl_coef
         _trainer_kwargs["use_lora_base"] = bool(training_args.use_lora)
     trainer = _trainer_cls(**_trainer_kwargs)
+    if _gain_cb is not None:
+        _gain_cb.trainer = trainer
     if _f_per_example and getattr(trainer, "_f6_mode", None) == "logits":
         # F6 fallback for a head the hidden-state path cannot drive: the loss
         # materialises the full (B, T, V) logits, so cap the per-device batch
@@ -795,8 +895,14 @@ def main():
 
         _lr_mult = sn56_plan.flag_float("SN56_LR_MULT")
         best_lr = sn56_plan.lr_for_batch(_lr_ref["lr"], _lr_ref["eff_bs"], _eff_bs_now(), _lr_mult)
-        trainer.args.learning_rate = best_lr
         _lr_note = f"finder x{_lr_mult:g} (lote efetivo {_lr_ref['eff_bs']}->{_eff_bs_now()})"
+        _lr_fixed = sn56_plan.lr_fixed()
+        if _lr_fixed is not None:
+            # SN56_LR_FIXED: the dev-selected second run (sn56_retry.py) trains at
+            # the first run's search argmin; the timed steps above still plan it.
+            best_lr = _lr_fixed
+            _lr_note = "fixo (SN56_LR_FIXED, 2a corrida)"
+        trainer.args.learning_rate = best_lr
         log_info(f"[sn56][cronometro] sem busca de LR: lr={best_lr:.2e} ({_lr_note})")
     elif _cached_lr is not None:
         import math
@@ -1236,6 +1342,11 @@ def main():
     if _f_eval_fix:
         _eval_cb.sn56_eval_skip_threshold = sn56_plan.eval_skip_threshold(
             _spe_f, _total_f, training_args.num_train_epochs)
+        # SN56_EVAL_FROM (epochs; second run of SN56_R1_COOLDOWN): evals start no later than this
+        _eval_from = sn56_plan.env_pos_float("SN56_EVAL_FROM")
+        if _eval_from is not None:
+            _eval_cb.sn56_eval_skip_threshold = min(_eval_cb.sn56_eval_skip_threshold,
+                                                    int(_eval_from * _spe_f))
         _eval_cb.total_steps_all_epochs = _total_f
     if _sn56_on:
         _eval_cb.sn56_planned_steps = _total_f
@@ -1266,11 +1377,15 @@ def main():
             f"bs={training_args.per_device_train_batch_size} ga={training_args.gradient_accumulation_steps} "
             f"neftune={training_args.neftune_noise_alpha} per_example_loss={_f_per_example}"
             f"{'/' + getattr(trainer, '_f6_mode', '') if _f_per_example else ''} "
+            f"alpha={_f6_alpha:g} dev_metric={'vali' if _f_dev_vali else 'stock'} gain={_f_gain} "
+            f"scale_repair={_f_scale_repair} "
             f"v5={_v5_mode or '-'}"
         )
     else:
-        log_info(f"[sn56][plan] correções inativas (tarefa={_task_type}, lora={training_args.use_lora}, "
-                 f"deepspeed={_use_deepspeed}) — caminho herdado")
+        log_info(f"[sn56][plan] correções F1-F4 inativas (tarefa={_task_type}, lora={training_args.use_lora}, "
+                 f"deepspeed={_use_deepspeed}) — caminho herdado; per_example_loss={_f_per_example}"
+                 f"{'/' + getattr(trainer, '_f6_mode', '') if _f_per_example else ''} alpha={_f6_alpha:g} "
+                 f"dev_metric={'vali' if _f_dev_vali else 'stock'} scale_repair={_f_scale_repair}")
 
     log_info(f"fiscalização a cada {training_args.eval_steps} passos, {len(dev_ds)} na prova")
     try:
@@ -1298,6 +1413,61 @@ def main():
             log_info("missão cumprida (guard)", "finish")
             return
         raise
+
+    # SN56_R1_AVG2, second run: try the 50:50 average with the first run's
+    # pre-dev-pass weights (SN56_AVG_WITH, set by sn56_retry); kept only if the
+    # validator-form dev metric improves (sn56_retry.try_blend).
+    _avg_with = os.environ.get("SN56_AVG_WITH", "").strip()
+    if (_avg_with and ckpt_avg is not None and training_args.world_size == 1
+            and is_main_process(LOCAL_RANK)):
+        try:
+            from sn56_retry import try_blend
+            try_blend(trainer, _avg_with, ckpt_avg, train_request["submission_dir"], log=log_info)
+        except Exception as _e:
+            log_info(f"[sn56][avg2] falhou ({_e!r}), mantendo a 2a corrida")
+
+    # Run record for the dev-selected second run (sn56_retry.py, SN56_LR_RETRY):
+    # the pre-dev-pass dev metric (soup / best checkpoint, the same number both
+    # runs are compared on), the LR used, the search argmin and the wall-clock.
+    if is_main_process(LOCAL_RANK):
+        try:
+            import lr_search as _lrs
+            _best_dev = None
+            if ckpt_avg is not None and getattr(ckpt_avg, "best_loss", None) is not None:
+                _best_dev = float(ckpt_avg.best_loss)
+            _best_step = sn56_plan.best_step_from_loss_txt(train_request["submission_dir"])
+            _early = int(trainer.state.global_step) < 0.9 * max(1, int(training_args.max_steps or 0))
+            _pre_dir = None
+            if (sn56_plan.flag_on("SN56_R1_AVG2") and sn56_plan.flag_on("SN56_LR_RETRY") and _early
+                    and sn56_plan.lr_fixed() is None and training_args.world_size == 1):
+                # the first run's pre-dev-pass weights, for the second run's average
+                _pre_dir = os.path.join(training_args.output_dir, "pre_devpass")
+                shutil.rmtree(_pre_dir, ignore_errors=True)
+                shutil.copytree(train_request["submission_dir"], _pre_dir)
+            sn56_plan.write_run_record(training_args.output_dir, {
+                "task_type": _task_type, "sn56_on": bool(_sn56_on), "use_kl": bool(use_kl),
+                "dev_metric": "vali" if _f_dev_vali else "stock", "dev": _best_dev,
+                "lr": float(trainer.args.learning_rate), "lr_fixed": sn56_plan.lr_fixed(),
+                "lr_argmin": getattr(_lrs, "LAST_ARGMIN", None) if _lr_search_s is not None else None,
+                "lr_search_s": _lr_search_s, "t_start": _t_main0, "t_train_end": time.time(),
+                "global_step": int(trainer.state.global_step), "max_steps": int(training_args.max_steps or -1),
+                "submission_dir": train_request["submission_dir"], "end_time": train_request["end_time"],
+                "best_step": _best_step, "spe": int(_spe_f), "stopped_early": bool(_early),
+                "pre_devpass_dir": _pre_dir, "world_size": int(training_args.world_size),
+            })
+        except Exception as _e:
+            log_info(f"[sn56][lr2] registro da corrida falhou ({_e!r})")
+
+    # SN56_LOGIT_CAL: fit one logit scale on dev with the validator's metric BEFORE the
+    # dev-pass trains on dev; folded into the submission files after it (sn56_logit_cal.py).
+    _logit_cal = None
+    if _feat["logit_cal"] and training_args.world_size == 1 and is_main_process(LOCAL_RANK):
+        try:
+            from sn56_logit_cal import fit_on_trainer
+            _logit_cal = fit_on_trainer(trainer, log=log_info)
+        except Exception as _e:
+            log_info(f"[sn56][logitcal] falhou ({_e!r}), sem calibração")
+            _logit_cal = None
 
     # ── Final dev-data pass (data maximization on small datasets) ──
     # The dev split was held out only for selection; the scored test set is
@@ -1361,6 +1531,13 @@ def main():
             )
     except Exception as _e:
         log_info(f"[sn56][devfit] dev-pass falhou ({_e}), mantendo melhor checkpoint")
+
+    if _logit_cal and _logit_cal.get("a", 1.0) != 1.0:
+        try:
+            from sn56_logit_cal import apply_to_submission
+            apply_to_submission(train_request["submission_dir"], _logit_cal["names"], _logit_cal["a"], log=log_info)
+        except Exception as _e:
+            log_info(f"[sn56][logitcal] gravação falhou ({_e!r}); submissão sem calibração")
 
     if is_main_process(LOCAL_RANK):
         success_file = os.path.join(training_args.output_dir, "success.txt")
