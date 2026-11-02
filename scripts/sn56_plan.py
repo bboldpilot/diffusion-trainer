@@ -54,9 +54,13 @@ the inherited code path for A/B:
                                             normalisation; one GPU unchanged) (sn56_loss.py)
   SN56_DEV_SCOREABLE      1        0     dev rows the validator would drop (> its eval sequence_len)
                                             are dropped from dev, not truncated (K1-a parity)
-  SN56_CHAT_EVAL          0        0     ChatTask full FT gets the InstructText plan (F1 evals,
+  SN56_CHAT_EVAL          1        0     ChatTask full FT gets the InstructText plan (F1 evals,
                                             F2 time plan + tail, F3 search, F4, guards): the inherited
                                             Chat path skipped every eval in a 0.75 h smoke (no_eval)
+  SN56_CHAT_SEARCH_8BIT   1        0     ChatTask with an 8-bit training optimizer: the LR search / step
+                                            timer probe with bitsandbytes AdamW8bit instead of torch AdamW;
+                                            on 4xH100 Qwen3-8B every warmup retry OOM'd down to batch 1, so
+                                            no step time -> no time plan, no evals (31 Oct)
   SN56_SOUP_CGROUP        1        0     soup snapshot RAM bound also respects the container's
                                             cgroup memory limit (never admits more, only fewer)
   SN56_TRAIN_SCOREABLE    0        0     ChatTask: training max_length capped at the validator's eval
@@ -135,7 +139,8 @@ FLAGS = {
     "SN56_R1_AVG2": ("1", "0"),
     "SN56_F6_GLOBAL": ("0", "0"),
     "SN56_DEV_SCOREABLE": ("1", "0"),
-    "SN56_CHAT_EVAL": ("0", "0"),
+    "SN56_CHAT_EVAL": ("1", "0"),
+    "SN56_CHAT_SEARCH_8BIT": ("1", "0"),
     "SN56_SOUP_CGROUP": ("1", "0"),
     "SN56_FP32_NORMS": ("0", "0"),
     "SN56_BATCH_DIV": ("1", "1"),

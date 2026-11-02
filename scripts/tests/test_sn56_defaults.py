@@ -45,7 +45,7 @@ def test_feature_matrix():
     assert it == {"sn56_on": True, "sft_full": True, "per_example": True, "alpha": 0.5, "dev_vali": True,
                   "gain": False, "scale_repair": True, "logit_cal": False, "fp32_norms": False}, it
     ch = f("ChatTask", False, None, False)
-    assert not ch["sn56_on"] and ch["per_example"] and ch["scale_repair"] and ch["dev_vali"] and not ch["gain"], ch
+    assert ch["sn56_on"] and ch["per_example"] and ch["scale_repair"] and ch["dev_vali"] and not ch["gain"], ch
     for lora, ds in ((True, None), (False, "ds_config/zero3.json")):
         for tt in ("InstructTextTask", "ChatTask"):
             x = f(tt, lora, ds, False)

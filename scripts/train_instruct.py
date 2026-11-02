@@ -809,6 +809,18 @@ def main():
     _cached_bs = _state_cache.get("best_lr_batch_size")
     _lr_note = "busca" if _f_lr_search else ""
     _lr_search_s = None
+    # SN56_CHAT_SEARCH_8BIT: ChatTask probes (search warmup/trials, step timer) keep
+    # 8-bit optimizer states like training. Their torch AdamW default OOM'd every
+    # warmup retry down to batch 1 on 4xH100 Qwen3-8B (31 Oct) while training fit,
+    # so t_per_step stayed None: no time plan, no evals. Not the paged variant: each
+    # trial builds a new optimizer and paged state buffers are not handed back.
+    # None keeps torch AdamW everywhere else.
+    _probe_opt = None
+    _optim_name = str(getattr(training_args.optim, "value", training_args.optim))
+    if (_task_type == "ChatTask" and sn56_plan.flag_on("SN56_CHAT_SEARCH_8BIT")
+            and _optim_name in ("paged_adamw_8bit", "adamw_8bit", "adamw_bnb_8bit")):
+        _probe_opt = bnb.optim.AdamW8bit
+        log_info(f"[sn56][farejando] ChatTask: sondas com AdamW8bit (--optim {_optim_name})")
     if not _f_lr_search:
         # ── F3 (SN56_LR_SEARCH=0): no search. The LR is the finder estimate
         # already in the command (lr_finder via instruct_config, x reg_ratio)
@@ -850,6 +862,7 @@ def main():
             grad_accum_steps=training_args.gradient_accumulation_steps,
             max_grad_norm=training_args.max_grad_norm,
             dataloader_factory=_halve_batch_timing_loader,
+            optimizer_cls=_probe_opt,
         )
         # Length-grouped (unpacked v5) batches are served longest-first, so the
         # timed steps over-state the epoch-average step cost: scale by tokens.
@@ -939,6 +952,7 @@ def main():
             train_dataloader=search_loader,
             initial_lr=training_args.learning_rate,
             hours_to_complete=train_request["hours_to_complete"],
+            optimizer_cls=_probe_opt,
             grad_accum_steps=training_args.gradient_accumulation_steps,
             max_grad_norm=training_args.max_grad_norm,
             dataloader_factory=_halve_batch_dataloader,

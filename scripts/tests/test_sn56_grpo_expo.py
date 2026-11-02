@@ -184,13 +184,13 @@ def test_pair_matches_validator_verbatim():
 
 def test_eval_cap():
     with _Env(SN56_GRPO_EVAL_CAP=None):
-        assert E.eval_cap(1000) == 1000
+        assert E.eval_cap(1000) == 400 and E.eval_cap(250) == 250
     for v, want in (("400", 400), ("5000", 1000), ("0", 1000), ("junk", 1000), ("-3", 1000)):
         with _Env(SN56_GRPO_EVAL_CAP=v):
             assert E.eval_cap(1000) == want, (v, want)
     src = (HERE / "train_grpo.py").read_text()
     assert "_cap = eval_cap(len(dev_ds))" in src and "dev_ds.select(range(_cap))" in src
-    print("[ok] SN56_GRPO_EVAL_CAP: off by default, caps the trainer's dev set, junk -> off")
+    print("[ok] SN56_GRPO_EVAL_CAP: 400 by default, caps the trainer's dev set, 0 or junk -> off")
 
 
 def test_kl_len_and_gen_config():

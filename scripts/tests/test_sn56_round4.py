@@ -1,5 +1,5 @@
-"""31 Oct flags: SN56_DEV_SCOREABLE, SN56_SOUP_CGROUP, SN56_CHAT_EVAL, SN56_R1_COOLDOWN, SN56_R1_AVG2,
-SN56_FP32_NORMS (SN56_F6_GLOBAL has its own DDP test, test_sn56_f6_ddp.py).
+"""31 Oct flags: SN56_DEV_SCOREABLE, SN56_SOUP_CGROUP, SN56_CHAT_EVAL (+ SN56_CHAT_SEARCH_8BIT), SN56_R1_COOLDOWN,
+SN56_R1_AVG2, SN56_FP32_NORMS (SN56_F6_GLOBAL has its own DDP test, test_sn56_f6_ddp.py).
 
 Run: python scripts/tests/test_sn56_round4.py   (torch, transformers 4.51.3, safetensors)
 """
@@ -27,13 +27,16 @@ def test_defaults():
     assert P.flag_on("SN56_LR_RETRY") and not P.flag_on("SN56_LOGIT_CAL")
     assert P.flag_on("SN56_DEV_SCOREABLE") and P.flag_on("SN56_SOUP_CGROUP")
     assert P.flag_on("SN56_R1_COOLDOWN") and P.flag_on("SN56_R1_AVG2")      # COOLAVG default since 1 Nov
-    for k in ("SN56_F6_GLOBAL", "SN56_CHAT_EVAL", "SN56_FP32_NORMS", "SN56_TRAIN_SCOREABLE"):
+    assert P.flag_on("SN56_CHAT_EVAL") and P.flag_on("SN56_CHAT_SEARCH_8BIT")  # boss-round Chat plan since 1 Nov
+    for k in ("SN56_F6_GLOBAL", "SN56_FP32_NORMS", "SN56_TRAIN_SCOREABLE"):
         assert not P.flag_on(k), k
     os.environ["SN56_TEXT_FIX"] = "0"
-    for k in ("SN56_LR_RETRY", "SN56_DEV_SCOREABLE", "SN56_SOUP_CGROUP", "SN56_R1_COOLDOWN", "SN56_R1_AVG2"):
+    for k in ("SN56_LR_RETRY", "SN56_DEV_SCOREABLE", "SN56_SOUP_CGROUP", "SN56_R1_COOLDOWN", "SN56_R1_AVG2",
+              "SN56_CHAT_EVAL", "SN56_CHAT_SEARCH_8BIT"):
         assert not P.flag_on(k), k
     _clear_env()
-    print("[ok] defaults: LR_RETRY on, LOGIT_CAL off, DEV_SCOREABLE + SOUP_CGROUP + COOLAVG on, new arms off; master rollback")
+    print("[ok] defaults: LR_RETRY on, LOGIT_CAL off, DEV_SCOREABLE + SOUP_CGROUP + COOLAVG + CHAT_EVAL on, "
+          "other arms off; master rollback")
 
 
 def test_scoreable_dev():
@@ -80,15 +83,23 @@ def test_cgroup_bound():
 
 def test_chat_eval_scope():
     _clear_env()
+    os.environ["SN56_CHAT_EVAL"] = "0"
     assert not P.sft_features("ChatTask", False, None, False)["sn56_on"]
-    os.environ["SN56_CHAT_EVAL"] = "1"
+    _clear_env()
     f = P.sft_features("ChatTask", False, None, False)
     assert f["sn56_on"] and f["per_example"] and f["scale_repair"]
     assert not P.sft_features("ChatTask", True, None, False)["sn56_on"]
     assert not P.sft_features("ChatTask", False, "ds.json", False)["sn56_on"]
     assert P.sft_features("InstructTextTask", False, None, False)["sn56_on"]
     _clear_env()
-    print("[ok] chat eval: ChatTask full FT joins the InstructText plan only with SN56_CHAT_EVAL (LoRA/DS never)")
+    src = open(os.path.join(HERE, "train_instruct.py")).read()
+    assert ('if (_task_type == "ChatTask" and sn56_plan.flag_on("SN56_CHAT_SEARCH_8BIT")\n'
+            '            and _optim_name in ("paged_adamw_8bit", "adamw_8bit", "adamw_bnb_8bit")):\n'
+            '        _probe_opt = bnb.optim.AdamW8bit') in src
+    assert src.count("optimizer_cls=_probe_opt,") == 2                  # step timer + LR search
+    assert src.index("_probe_opt = None") < src.index("measure_step_time(") < src.index("run_lr_search(")
+    print("[ok] chat eval: ChatTask full FT joins the InstructText plan by default (SN56_CHAT_EVAL=0 opts out; "
+          "LoRA/DS never); its probes use AdamW8bit")
 
 
 def _rec(**kw):

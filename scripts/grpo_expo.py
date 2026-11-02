@@ -51,11 +51,12 @@ def _parity() -> bool:
 
 
 def eval_cap(n_dev: int) -> int:
-    """SN56_GRPO_EVAL_CAP (default 0 = off, train_grpo.py): the trainer's evals sample only the first N dev prompts (dev
-    order is shuffled). Every eval, including the end_time one that must finish before run_expo starts, samples each dev
-    prompt twice: 21 Sep task, 0.5B, 725 prompts: 295 s of the 660 s reserve; a 1000-prompt 1.5B task may eat all of it."""
+    """SN56_GRPO_EVAL_CAP (default 400, 0 = off, train_grpo.py): the trainer's evals sample only the first N dev prompts
+    (dev order is shuffled). Every eval, including the end_time one that must finish before run_expo starts, samples each
+    dev prompt twice: 21 Sep task, 0.5B, 725 prompts: 295 s of the 660 s reserve; a 1000-prompt 1.5B task may eat all of
+    it (without the cap the grid stopped before alpha 1.5 on a 1.5B task and alpha 1 shipped; 400 fits the whole grid)."""
     try:
-        cap = int(os.environ.get("SN56_GRPO_EVAL_CAP", "0"))
+        cap = int(os.environ.get("SN56_GRPO_EVAL_CAP", "400"))
     except ValueError:
         return n_dev
     return min(cap, n_dev) if cap > 0 else n_dev

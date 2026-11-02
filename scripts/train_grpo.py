@@ -458,7 +458,7 @@ def main():
     t2 = datetime.datetime.now()
     log_info(f"truncagem concluída em {(t2 - t1).seconds}s")
 
-    # [sn56] SN56_GRPO_EVAL_CAP (default off): trainer evals on the first N dev prompts (grpo_expo.eval_cap)
+    # [sn56] SN56_GRPO_EVAL_CAP (default 400): trainer evals on the first N dev prompts (grpo_expo.eval_cap)
     from grpo_expo import eval_cap
     _cap = eval_cap(len(dev_ds))
     if _cap < len(dev_ds):
